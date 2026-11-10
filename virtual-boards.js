@@ -11,6 +11,9 @@
   let stopMarkersById = new Map();
   let transportData = null;
   let lastBoardData = null;
+  const REALTIME_ARRIVAL_HISTORY_KEY = 'gtsofia.virtualBoard.realtimeArrivalHistory.v1';
+  const REALTIME_ARRIVAL_HISTORY_TTL_SECONDS = 36 * 60 * 60;
+  let realtimeArrivalHistoryMemory = [];
   const boardPanel = () =>
     document.getElementById("virtualBoardBody");
 
@@ -81,6 +84,162 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  function normalizeTripDate(value) {
+    return String(value ?? '').trim().replace(/-/g, '');
+  }
+
+  function getArrivalTripIdentity(route, time, stopId) {
+    const identity = {
+      stop_id: String(stopId ?? '').trim(),
+      route_id: String(time?.route_id || route?.route_id || '').trim(),
+      trip_id: String(
+        time?.trip_id
+        || route?.matched_static_trip_id
+        || route?.trip_id
+        || route?.original_trip_id
+        || ''
+      ).trim(),
+      trip_start_date: normalizeTripDate(
+        time?.trip_start_date || route?.trip_start_date || ''
+      ),
+      trip_start_time: String(
+        time?.trip_start_time || route?.trip_start_time || ''
+      ).trim(),
+      direction_id: String(time?.direction_id || route?.direction_id || '').trim()
+    };
+
+    if (!identity.stop_id || !identity.route_id) return null;
+    if (!identity.trip_id && !identity.trip_start_time) return null;
+    return identity;
+  }
+
+  function sameArrivalTrip(left, right) {
+    if (!left || !right) return false;
+    if (left.stop_id !== right.stop_id || left.route_id !== right.route_id) return false;
+
+    if (left.trip_id && right.trip_id) {
+      if (left.trip_id !== right.trip_id) return false;
+    } else if (!left.trip_start_time || !right.trip_start_time
+      || left.trip_start_time !== right.trip_start_time) {
+      return false;
+    }
+
+    if (left.trip_start_date && right.trip_start_date
+      && left.trip_start_date !== right.trip_start_date) return false;
+    if (left.trip_start_time && right.trip_start_time
+      && left.trip_start_time !== right.trip_start_time) return false;
+    if (left.direction_id && right.direction_id
+      && left.direction_id !== right.direction_id) return false;
+
+    return true;
+  }
+
+  function readRealtimeArrivalHistory(nowSeconds = Date.now() / 1000) {
+    let stored = [];
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const parsed = JSON.parse(
+          localStorage.getItem(REALTIME_ARRIVAL_HISTORY_KEY) || '[]'
+        );
+        if (Array.isArray(parsed)) stored = parsed;
+      }
+    } catch {
+      // Storage may be unavailable in private/restricted browsing contexts.
+    }
+
+    const cutoff = nowSeconds - REALTIME_ARRIVAL_HISTORY_TTL_SECONDS;
+    const combined = [...stored, ...realtimeArrivalHistoryMemory]
+      .filter(item => Number(item?.remembered_at) >= cutoff
+        && Number.isFinite(Number(item?.timestamp)));
+
+    const unique = new Map();
+    for (const item of combined) {
+      const identity = item?.identity;
+      if (!identity) continue;
+      const key = [
+        identity.stop_id,
+        identity.route_id,
+        identity.trip_id,
+        identity.trip_start_date,
+        identity.trip_start_time,
+        identity.direction_id
+      ].join('|');
+      const existing = unique.get(key);
+      if (!existing || Number(item.remembered_at) >= Number(existing.remembered_at)) {
+        unique.set(key, item);
+      }
+    }
+
+    return [...unique.values()].slice(-500);
+  }
+
+  function writeRealtimeArrivalHistory(history) {
+    realtimeArrivalHistoryMemory = history.slice(-500);
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(
+          REALTIME_ARRIVAL_HISTORY_KEY,
+          JSON.stringify(realtimeArrivalHistoryMemory)
+        );
+      }
+    } catch {
+      // The in-memory copy still protects refreshes in the current page.
+    }
+  }
+
+  function rememberRealtimeArrivalPredictions(boardData, stopId, nowSeconds = Date.now() / 1000) {
+    const history = readRealtimeArrivalHistory(nowSeconds);
+    const next = [...history];
+
+    for (const route of Array.isArray(boardData?.routes) ? boardData.routes : []) {
+      for (const time of Array.isArray(route?.times) ? route.times : []) {
+        if (time?.scheduled === true || (route?.realtime !== true && time?.source !== 'realtime')) continue;
+        const timestamp = Number(time?.timestamp);
+        if (!Number.isFinite(timestamp)) continue;
+        const identity = getArrivalTripIdentity(route, time, stopId);
+        if (!identity) continue;
+
+        const matchingIndex = next.findIndex(item => sameArrivalTrip(item.identity, identity));
+        const record = { identity, timestamp, remembered_at: nowSeconds };
+        if (matchingIndex >= 0) next[matchingIndex] = record;
+        else next.push(record);
+      }
+    }
+
+    writeRealtimeArrivalHistory(next.filter(item =>
+      Number(item?.remembered_at) >= nowSeconds - REALTIME_ARRIVAL_HISTORY_TTL_SECONDS
+    ));
+  }
+
+  function suppressPassedRealtimeFallbacks(boardData, stopId, nowSeconds = Date.now() / 1000) {
+    const history = readRealtimeArrivalHistory(nowSeconds);
+    let removedAny = false;
+    const routes = (Array.isArray(boardData?.routes) ? boardData.routes : [])
+      .map(route => {
+        const times = (Array.isArray(route?.times) ? route.times : []).filter(time => {
+          if (time?.scheduled !== true) return true;
+          const identity = getArrivalTripIdentity(route, time, stopId);
+          if (!identity) return true;
+
+          const wasPredictedRealtime = history.some(item =>
+            sameArrivalTrip(item.identity, identity)
+            && Number(item.timestamp) <= nowSeconds
+          );
+          if (wasPredictedRealtime) removedAny = true;
+          return !wasPredictedRealtime;
+        });
+        return { ...route, times };
+      })
+      .filter(route => route.times.length > 0);
+
+    return {
+      ...boardData,
+      status: routes.length ? (boardData?.status || 'ok') : 'empty',
+      routes,
+      passed_realtime_fallbacks_suppressed: removedAny
+    };
   }
 
   function getStopDisplayName(stop) {
@@ -361,12 +520,19 @@
       );
     }
 
-    return {
+    const normalized = {
       ...data,
       status: data?.status || 'empty',
       routes: Array.isArray(data?.routes) ? data.routes : [],
       loaded_at: Date.now() / 1000
     };
+
+    // Remember the last realtime prediction for each exact trip. Some feeds
+    // remove a vehicle as soon as it has passed the selected stop; on the next
+    // manual refresh that same trip can otherwise reappear from GTFS with its
+    // later scheduled time (e.g. actual 14:39 vs timetable 14:42).
+    rememberRealtimeArrivalPredictions(normalized, stopCode, normalized.loaded_at);
+    return suppressPassedRealtimeFallbacks(normalized, stopCode, normalized.loaded_at);
   }
 
   function bindRefreshButton() {
@@ -398,7 +564,7 @@
     if (!statusElement) return;
 
     const realtimeStatus = String(data?.realtime_status || 'available');
-    let label = 'Realtime прогнози и GTFS разписание';
+    let label = '';
     let statusClass = 'is-live';
 
     if (realtimeStatus === 'unavailable') {
@@ -418,7 +584,7 @@
     }
 
     statusElement.innerHTML = `
-      <span class="vb-board-status-label ${statusClass}">${escapeHtml(label)}</span>
+      ${label ? `<span class="vb-board-status-label ${statusClass}">${escapeHtml(label)}</span>` : ''}
       <span class="vb-board-updated">Обновено: ${escapeHtml(formatBoardUpdatedAt(snapshotSeconds))}</span>
     `;
   }
@@ -1608,6 +1774,8 @@
 
   // Small test seam; production pages do not use this object.
   globalThis.__gtsofiaVirtualBoardTestInternals = {
-    formatArrivalCountdown
+    formatArrivalCountdown,
+    rememberRealtimeArrivalPredictions,
+    suppressPassedRealtimeFallbacks
   };
 })();

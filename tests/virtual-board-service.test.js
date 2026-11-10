@@ -732,6 +732,11 @@ assert.ok(
   tm22FallbackAt2086.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-11-10T05:20:00+02:00') / 1000)),
   'tram 22 at 2086 must use its GTFS time when the realtime updates begin at the later stop 0470'
 );
+assert.ok(
+  tm22FallbackAt2086.some(time => time.scheduled && time.trip_id === tm22Course.original_trip_id
+    && time.trip_start_time === tm22Course.start_time),
+  'GTFS fallback arrivals must retain the exact scheduled trip identity for passed-realtime suppression'
+);
 const tm22BoardAt0470 = actual.buildBoard({
   routes: [], skipped_trips: [], realtime_trips: [tm22RealtimeTrip]
 }, '0470', tm22NowBefore2086);
@@ -739,6 +744,11 @@ const tm22RealtimeAt0470 = tm22BoardAt0470.routes.find(route =>
   route.route_id === 'TM22' && route.times.some(time => !time.scheduled && Math.round(time.timestamp) === Math.round(tm22UpdateAt0470))
 );
 assert.ok(tm22RealtimeAt0470, 'tram 22 at 0470 must use the provided realtime prediction');
+assert.ok(
+  tm22RealtimeAt0470.times.some(time => !time.scheduled && time.trip_id === tm22Course.original_trip_id
+    && time.trip_start_time === tm22Course.start_time),
+  'realtime arrivals must retain the same exact trip identity as their GTFS fallback'
+);
 assert.equal(tm22RealtimeAt0470.terminal_stop_id, '2023', 'the destination must remain the full GTFS terminal, not the last partial realtime update');
 assert.equal(tm22RealtimeAt0470.destination, 'Автостанция Изток', 'the full-course destination must resolve to the terminal stop name');
 const tm22BoardAt0633 = actual.buildBoard({

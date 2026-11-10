@@ -564,6 +564,11 @@ function createDataContext(data = {}) {
         scheduled: false,
         source: 'realtime',
         scheduled_time: targetScheduledTimestamp,
+        route_id: routeId,
+        trip_id: originalTripId || String(staticInfo.schedule?.original_trip_id || '').trim(),
+        trip_start_date: realtimeDate || normalizeServiceDate(getSofiaDateKey(now)),
+        trip_start_time: staticStartTime || realtimeStartTime,
+        direction_id: staticDirectionId,
         uncertainty: optionalFiniteNumber(targetEvent?.uncertainty) ?? propagatedUncertainty,
         stop_schedule_relationship: targetRelationship,
         stop_schedule_relationship_name: targetRelationship === 1 ? 'SKIPPED' : (targetRelationship === 2 ? 'NO_DATA' : 'SCHEDULED')
@@ -667,7 +672,21 @@ function createDataContext(data = {}) {
           stop_index: stopIndex,
           static_trip_id: String(schedule?.trip_id ?? '').trim(),
           trip_start_time: String(schedule?.start_time || '').trim(),
-          times: [{ timestamp, delay: null, scheduled: true, source: 'static' }],
+          times: [{
+            timestamp,
+            delay: null,
+            scheduled: true,
+            source: 'static',
+            // Keep the identity on each arrival, not only on the route row.
+            // mergeRoutes can combine several trips serving the same
+            // destination; the browser needs to distinguish the exact trip
+            // whose realtime prediction it previously showed.
+            route_id: routeId,
+            trip_id: String(schedule?.original_trip_id || '').trim(),
+            trip_start_date: normalizeServiceDate(getSofiaDateKey(now)),
+            trip_start_time: String(schedule?.start_time || '').trim(),
+            direction_id: String(direction?.direction_id ?? '').trim()
+          }],
           scheduled: true,
           source: 'static'
         });
@@ -1053,6 +1072,16 @@ function createDataContext(data = {}) {
           scheduled: false,
           source: 'realtime',
           scheduled_time: scheduledTime,
+          // Preserve the scheduled-trip identity at event level so a client
+          // can remember a realtime arrival after the upstream feed removes
+          // the vehicle once it has passed the stop.
+          route_id: routeId,
+          trip_id: realtimeTripId || String(staticInfo?.schedule?.original_trip_id || '').trim(),
+          trip_start_date: normalizeServiceDate(
+            route?.trip_start_date || route?.start_date || getSofiaDateKey(now)
+          ),
+          trip_start_time: String(route?.trip_start_time || staticInfo?.schedule?.start_time || '').trim(),
+          direction_id: String(route?.direction_id ?? staticInfo?.direction?.direction_id ?? '').trim(),
           uncertainty: optionalFiniteNumber(time?.uncertainty),
           stop_schedule_relationship: optionalFiniteNumber(time?.stop_schedule_relationship),
           stop_schedule_relationship_name: String(time?.stop_schedule_relationship_name || 'SCHEDULED')

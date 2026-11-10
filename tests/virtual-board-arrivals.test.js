@@ -5,13 +5,16 @@ const path = require('node:path');
 
 const sourcePath = path.join(__dirname, '..', 'virtual-boards.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+const localStorageData = new Map();
 const context = {
   console,
   Math,
   Intl,
   URLSearchParams,
-  localStorage: { getItem: () => '[]', setItem() {} },
-  sessionStorage: { getItem: () => '[]', setItem() {} },
+  localStorage: {
+    getItem: key => localStorageData.get(key) || '[]',
+    setItem: (key, value) => localStorageData.set(key, value)
+  },
   document: { addEventListener() {} },
   window: {},
   Date
@@ -19,7 +22,11 @@ const context = {
 context.globalThis = context;
 
 vm.runInNewContext(source, context, { filename: sourcePath });
-const { formatArrivalCountdown } = context.__gtsofiaVirtualBoardTestInternals;
+const {
+  formatArrivalCountdown,
+  rememberRealtimeArrivalPredictions,
+  suppressPassedRealtimeFallbacks
+} = context.__gtsofiaVirtualBoardTestInternals;
 
 const now = 1_000;
 const cases = [
@@ -59,5 +66,96 @@ assert.equal(
 );
 assert.doesNotMatch(source, /\bsetInterval\s*\(/, 'virtual boards must not start periodic refresh or countdown timers');
 assert.doesNotMatch(source, /updateBoardCountdowns|startTimers|data-arrival-timestamp/, 'automatic minute updates and their DOM hooks must be removed');
+assert.doesNotMatch(source, /Realtime прогнози и GTFS разписание/, 'the generic realtime/GTFS status label must be removed');
+
+// If a realtime prediction was shown before the vehicle arrived, remember
+// that exact trip. The next feed may already have removed it; its later GTFS
+// timetable time must not resurrect the same course ahead of the next trip.
+const stopId = '0470';
+const previousRealtimeSnapshot = {
+  routes: [{
+    route_id: 'TM22',
+    trip_id: 'TM22-TRIP-42',
+    trip_start_date: '20261110',
+    trip_start_time: '14:00:00',
+    direction_id: '2',
+    realtime: true,
+    times: [{
+      timestamp: 14 * 3600 + 39 * 60,
+      scheduled: false,
+      source: 'realtime',
+      route_id: 'TM22',
+      trip_id: 'TM22-TRIP-42',
+      trip_start_date: '20261110',
+      trip_start_time: '14:00:00',
+      direction_id: '2'
+    }]
+  }]
+};
+const beforeArrival = 14 * 3600 + 38 * 60;
+const afterArrival = 14 * 3600 + 40 * 60;
+rememberRealtimeArrivalPredictions(previousRealtimeSnapshot, stopId, beforeArrival);
+
+const refreshedTimetableSnapshot = {
+  status: 'ok',
+  routes: [{
+    route_id: 'TM22',
+    destination: 'Автостанция Изток',
+    times: [
+      {
+        timestamp: 14 * 3600 + 42 * 60,
+        scheduled: true,
+        source: 'static',
+        route_id: 'TM22',
+        trip_id: 'TM22-TRIP-42',
+        trip_start_date: '20261110',
+        trip_start_time: '14:00:00',
+        direction_id: '2'
+      },
+      {
+        timestamp: 14 * 3600 + 50 * 60,
+        scheduled: true,
+        source: 'static',
+        route_id: 'TM22',
+        trip_id: 'TM22-TRIP-50',
+        trip_start_date: '20261110',
+        trip_start_time: '14:10:00',
+        direction_id: '2'
+      },
+      {
+        timestamp: 14 * 3600 + 45 * 60,
+        scheduled: true,
+        source: 'static',
+        route_id: 'TM22',
+        trip_id: 'TM22-TRIP-42',
+        trip_start_date: '20261110',
+        trip_start_time: '14:05:00',
+        direction_id: '2'
+      }
+    ]
+  }]
+};
+const refreshedAfterVehiclePassed = suppressPassedRealtimeFallbacks(
+  refreshedTimetableSnapshot,
+  stopId,
+  afterArrival
+);
+assert.equal(refreshedAfterVehiclePassed.routes.length, 1, 'the line must remain visible after removing the passed trip');
+assert.deepEqual(
+  refreshedAfterVehiclePassed.routes[0].times.map(time => time.trip_start_time).sort(),
+  ['14:05:00', '14:10:00'],
+  'a passed realtime trip must not return with its later GTFS time; a separate instance of the same trip template and the next course must remain'
+);
+
+const beforeRealtimeArrival = suppressPassedRealtimeFallbacks(
+  refreshedTimetableSnapshot,
+  stopId,
+  beforeArrival
+);
+assert.deepEqual(
+  beforeRealtimeArrival.routes[0].times.map(time => time.trip_start_time).sort(),
+  ['14:00:00', '14:05:00', '14:10:00'],
+  'a remembered realtime prediction must not suppress its GTFS fallback before its predicted arrival'
+);
 
 console.log('virtual-board-arrivals: presentation tests passed');
