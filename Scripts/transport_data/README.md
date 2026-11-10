@@ -16,7 +16,14 @@
 commonly used functions so existing tests and scripts can continue importing it.
 
 
-OSM name updates are failure-safe: the generator merges fresh Overpass results
-with the last known-good `data/stops.json` snapshot. If Overpass is unavailable
-or returns only a partial result, existing OSM names are retained and GTFS
-remains only the fallback for stops that have never had an OSM name.
+OSM name updates use a primary Overpass instance plus fallback mirrors. The
+query covers node, way and relation stop objects, including the standard
+`railway=station` tagging used by metro stations. A response is accepted only
+when it contains at least 3,000 named public stops.
+
+The generator merges a complete fresh response with the last known-good
+`data/stops.json` snapshot. If Overpass is unavailable or returns only a
+partial result, the previous complete OSM snapshot is retained. If there is no
+complete snapshot to fall back to, generation stops before writing any output
+files; it must never publish a GTFS-only replacement merely because the OSM
+service failed.

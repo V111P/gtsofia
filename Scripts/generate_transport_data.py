@@ -8,7 +8,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from transport_data.config import (  # noqa: F401
-    GTFS_URL, OSM_URL, OSM_NETWORK_NAME, OSM_STOP_TYPES, ROOT, DATA_DIR,
+    GTFS_URL, OSM_URL, OSM_FALLBACK_URLS, OSM_NETWORK_NAME,
+    OSM_STOP_TYPES, OSM_STOP_FILTERS, OSM_MIN_NAMED_STOPS, ROOT, DATA_DIR,
     GTFS_DIR, LEGACY_OUTPUT_FILE, CALENDAR_CONFIG_FILE,
     SOFIA_TIME_ZONE, GTFS_WEEKDAY_FIELDS,
     normalize, normalize_stop_id, normalize_osm_stop_code,
@@ -18,6 +19,7 @@ from transport_data.gtfs import download_gtfs, read_csv  # noqa: F401
 from transport_data.osm import (  # noqa: F401
     fetch_osm_stops, enrich_stops_with_osm,
     previous_osm_stops_from_rows, merge_osm_stop_snapshots,
+    resolve_osm_stop_snapshot, build_osm_stop_query,
 )
 from transport_data.calendar import (  # noqa: F401
     _calendar_row_covers_date, _apply_calendar_date_exceptions,

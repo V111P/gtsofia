@@ -770,6 +770,10 @@ def choose_direction_name(
 
     if terminal_stop:
         osm_name = normalize(terminal_stop.get("osm_stop_name"))
+        # Older OSM-enriched snapshots kept the chosen display name in
+        # stop_name without duplicating it into osm_stop_name.
+        if not osm_name and terminal_stop.get("stop_name_source") == "osm":
+            osm_name = normalize(terminal_stop.get("stop_name"))
         if osm_name:
             return osm_name
 
