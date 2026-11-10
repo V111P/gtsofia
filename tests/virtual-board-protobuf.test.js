@@ -35,8 +35,14 @@ const res = {
 
 (async () => {
   await handler(req, res);
-  assert.equal(res.statusCode, 502, 'a malformed protobuf feed must fail closed');
-  assert.match(res.payload.error, /protobuf varint/i);
+  assert.equal(res.statusCode, 200, 'a malformed realtime feed must not take down a virtual board');
+  assert.equal(res.payload.realtime_status, 'unavailable');
+  assert.match(res.payload.realtime_message, /показваме разписанието/i);
+  assert.ok(Array.isArray(res.payload.routes));
+  assert.ok(
+    res.payload.routes.every(route => route.times.every(time => time.scheduled === true)),
+    'a malformed protobuf feed must fall back to clearly marked GTFS arrivals'
+  );
 
   // The stateless board service cannot reconstruct a DIFFERENTIAL feed because
   // it does not retain an upstream entity state between snapshots.
@@ -47,8 +53,13 @@ const res = {
   feed = field(1, 2, header);
 
   await handler(req, res);
-  assert.equal(res.statusCode, 502, 'a differential feed must not be mistaken for a full snapshot');
-  assert.match(res.payload.error, /differential feeds are not supported/i);
+  assert.equal(res.statusCode, 200, 'an unsupported differential feed must not take down a virtual board');
+  assert.equal(res.payload.realtime_status, 'unavailable');
+  assert.match(res.payload.realtime_message, /показваме разписанието/i);
+  assert.ok(
+    res.payload.routes.every(route => route.times.every(time => time.scheduled === true)),
+    'a differential feed must fall back to GTFS instead of being mistaken for a complete snapshot'
+  );
 
   console.log('virtual-board-protobuf: all tests passed');
 })().catch(error => {

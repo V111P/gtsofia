@@ -1,19 +1,16 @@
 (() => {
-  const REFRESH_MS = 15000;
   const SOFIA_TIME_ZONE = "Europe/Sofia";
   const SOFIA_CENTER = [42.6977, 23.3219];
 
   let map = null;
   let selectedStopId = null;
-  let refreshTimer = null;
-  let countdownTimer = null;
   let refreshInFlight = false;
-  let lastExpiredPrimaryArrival = null;
   let boardRenderToken = 0;
   let stopMarkers = null;
   let selectedStopMarker = null;
   let stopMarkersById = new Map();
   let transportData = null;
+  let lastBoardData = null;
   const boardPanel = () =>
     document.getElementById("virtualBoardBody");
 
@@ -181,6 +178,8 @@
     const remainingSeconds =
       seconds - nowSeconds;
 
+    // Minutes are calculated once from the board's load timestamp. They stay
+    // fixed until the user explicitly presses the refresh button.
     // Arrival has reached the stop.
     if (remainingSeconds <= 0) {
       return "0 мин.";
@@ -188,8 +187,7 @@
 
     // Display whole minutes only, rounded to the nearest minute from the exact
     // remaining seconds (half a minute rounds up): 9:01 -> 9 мин., 9:30 ->
-    // 10 мин. A remaining time below 30 seconds rounds to 0 мин.; the actual
-    // countdown is recalculated from the timestamp on each refresh.
+    // 10 мин. A remaining time below 30 seconds rounds to 0 мин.
     const minutes = Math.round(remainingSeconds / 60);
 
     return `${minutes} мин.`;
@@ -220,7 +218,8 @@
 
   function countdownHtml(
     arrival,
-    showLive
+    showLive,
+    snapshotSeconds = Date.now() / 1000
   ) {
     const timestamp =
       Number(arrival?.timestamp);
@@ -241,7 +240,8 @@
 
     const countdown =
       formatArrivalCountdown(
-        timestamp
+        timestamp,
+        snapshotSeconds
       );
 
     return (
@@ -251,8 +251,7 @@
       + `${escapeHtml(clock)}`
       + `</span>`
       + `<span class="vb-arrival-separator" aria-hidden="true">·</span>`
-      + `<span class="vb-arrival-minutes"`
-      + ` data-arrival-timestamp="${timestamp}">`
+      + `<span class="vb-arrival-minutes">`
       + `${escapeHtml(countdown)}`
       + `</span>`
       + `</div>`
@@ -335,8 +334,10 @@
   }
 
   async function fetchVirtualBoardViaServer(stop) {
+    // stop_id is unambiguous for metro stops, whose stop_code may overlap
+    // with a road-transport stop code.
     const stopCode = String(
-      stop?.stop_code || stop?.stop_id || ''
+      stop?.stop_id || stop?.stop_code || ''
     ).trim();
 
     if (!stopCode) {
@@ -361,8 +362,10 @@
     }
 
     return {
+      ...data,
       status: data?.status || 'empty',
-      routes: Array.isArray(data?.routes) ? data.routes : []
+      routes: Array.isArray(data?.routes) ? data.routes : [],
+      loaded_at: Date.now() / 1000
     };
   }
 
@@ -376,7 +379,48 @@
 
     button.onclick =
       () =>
-        refreshSelectedBoard(true);
+        refreshSelectedBoard();
+  }
+
+  function formatBoardUpdatedAt(timestamp) {
+    const seconds = Number(timestamp);
+    if (!Number.isFinite(seconds)) return '—';
+    return new Intl.DateTimeFormat('bg-BG', {
+      timeZone: SOFIA_TIME_ZONE,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).format(new Date(seconds * 1000));
+  }
+
+  function renderBoardStatus(panel, data, snapshotSeconds, warning = '') {
+    const statusElement = panel?.querySelector('.vb-board-status');
+    if (!statusElement) return;
+
+    const realtimeStatus = String(data?.realtime_status || 'available');
+    let label = 'Realtime прогнози и GTFS разписание';
+    let statusClass = 'is-live';
+
+    if (realtimeStatus === 'unavailable') {
+      label = data?.realtime_message || 'Realtime временно недостъпен — показваме разписанието.';
+      statusClass = 'is-warning';
+    } else if (realtimeStatus === 'not_applicable') {
+      label = data?.realtime_message || 'По разписание';
+      statusClass = 'is-scheduled';
+    }
+
+    if (warning) {
+      statusElement.innerHTML = `
+        <span class="vb-board-status-label is-warning">${escapeHtml(warning)}</span>
+        <span class="vb-board-updated">Последно успешно зареждане: ${escapeHtml(formatBoardUpdatedAt(snapshotSeconds))}</span>
+      `;
+      return;
+    }
+
+    statusElement.innerHTML = `
+      <span class="vb-board-status-label ${statusClass}">${escapeHtml(label)}</span>
+      <span class="vb-board-updated">Обновено: ${escapeHtml(formatBoardUpdatedAt(snapshotSeconds))}</span>
+    `;
   }
 
   function renderBoardList(
@@ -389,6 +433,9 @@
       );
 
     if (!list) return;
+
+    const snapshotSeconds = Number(data?.loaded_at) || Date.now() / 1000;
+    renderBoardStatus(panel, data, snapshotSeconds);
 
     if (
       data.status !== "ok"
@@ -436,7 +483,8 @@
                 time => {
                   const tooltip =
                     formatArrivalCountdown(
-                      time.timestamp
+                      time.timestamp,
+                      snapshotSeconds
                     );
 
                   const clock =
@@ -447,7 +495,6 @@
                   return (
                     `<span class="vb-next-time"`
                     + ` tabindex="0"`
-                    + ` data-arrival-timestamp="${time.timestamp}"`
                     + ` data-tooltip="${escapeHtml(
                         tooltip
                       )}"`
@@ -474,7 +521,8 @@
               <div class="vb-time-block">
                 ${countdownHtml(
                   arrivals[0],
-                  !arrivals[0]?.scheduled
+                  !arrivals[0]?.scheduled,
+                  snapshotSeconds
                 )}
                 ${
                   arrivals.length > 1
@@ -503,6 +551,7 @@
       String(
         stop.stop_id
       );
+    lastBoardData = null;
 
     const panel =
       boardPanel();
@@ -511,7 +560,7 @@
 
     panel.innerHTML = `
       <div class="virtual-board-header">
-        <div>
+        <div class="vb-board-heading">
           <div class="virtual-board-kicker">Спирка ${escapeHtml(
             stop.stop_code
             || stop.stop_id
@@ -520,6 +569,7 @@
           <h2>${escapeHtml(
             getStopDisplayName(stop)
           )}</h2>
+          <div class="vb-board-status" role="status" aria-live="polite"></div>
         </div>
         <div class="virtual-board-header-actions">
           <button type="button" class="virtual-board-refresh is-loading" id="virtualBoardRefresh" disabled aria-label="Обнови таблото" title="Обнови таблото"><span aria-hidden="true">↻</span></button>
@@ -561,9 +611,7 @@
 
           selectedStopId =
             null;
-
-          lastExpiredPrimaryArrival =
-            null;
+          lastBoardData = null;
 
           if (selectedStopMarker) {
             selectedStopMarker.setStyle(
@@ -646,6 +694,7 @@
         return;
       }
 
+      lastBoardData = data;
       renderBoardList(
         panel,
         data
@@ -667,10 +716,11 @@
         error
       );
 
-      panel.querySelector(
-        ".virtual-board-list"
-      ).innerHTML =
-        `<div class="virtual-board-error">Realtime данните не могат да бъдат заредени.</div>`;
+      const list = panel.querySelector('.virtual-board-list');
+      if (list) {
+        list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Опитайте отново с бутона за обновяване.</div>`;
+      }
+      renderBoardStatus(panel, { realtime_status: 'unavailable' }, null, 'Неуспешно зареждане');
     } finally {
       if (
         renderToken
@@ -1436,282 +1486,52 @@
     );
   }
 
-  function updateBoardCountdowns() {
-    const panel =
-      boardPanel();
+  async function refreshSelectedBoard() {
+    if (!selectedStopId || refreshInFlight) return;
 
-    if (
-      !panel
-      || !selectedStopId
-    ) {
-      return;
-    }
+    const requestedStopId = String(selectedStopId);
+    const requestToken = boardRenderToken;
+    const stop = findStopById(requestedStopId);
+    if (!stop) return;
 
-    const nowSeconds =
-      Date.now() / 1000;
+    const refreshButton = document.getElementById('virtualBoardRefresh');
+    refreshButton?.classList.add('is-loading');
+    if (refreshButton) refreshButton.disabled = true;
 
-    let primaryArrivalExpired =
-      null;
-
-    panel
-      .querySelectorAll(
-        "[data-arrival-timestamp]"
-      )
-      .forEach(
-        element => {
-          const timestamp =
-            Number(
-              element.dataset
-                .arrivalTimestamp
-            );
-
-          if (
-            !Number.isFinite(
-              timestamp
-            )
-          ) {
-            return;
-          }
-
-          const countdown =
-            formatArrivalCountdown(
-              timestamp,
-              nowSeconds
-            );
-
-          if (
-            element.classList.contains(
-              "vb-arrival-minutes"
-            )
-          ) {
-            element.textContent =
-              countdown;
-
-            if (
-              timestamp
-              <= nowSeconds
-            ) {
-              primaryArrivalExpired =
-                timestamp;
-            }
-
-            return;
-          }
-
-          element.dataset.tooltip =
-            countdown;
-
-          element.setAttribute(
-            "aria-label",
-            countdown
-          );
-        }
-      );
-
-    if (
-      primaryArrivalExpired
-        !== null
-      && primaryArrivalExpired
-        !== lastExpiredPrimaryArrival
-      && !refreshInFlight
-    ) {
-      lastExpiredPrimaryArrival =
-        primaryArrivalExpired;
-
-      refreshSelectedBoard(true);
-    }
-  }
-
-  function startTimers() {
-    clearInterval(
-      refreshTimer
-    );
-
-    clearInterval(
-      countdownTimer
-    );
-
-    countdownTimer =
-      setInterval(
-        updateBoardCountdowns,
-        1000
-      );
-
-    refreshTimer =
-      setInterval(
-        () => {
-          if (
-            selectedStopId
-          ) {
-            refreshSelectedBoard(true);
-          }
-        },
-        REFRESH_MS
-      );
-
-    updateBoardCountdowns();
-  }
-
-  async function refreshSelectedBoard(
-    force = false
-  ) {
-    if (
-      !selectedStopId
-      || refreshInFlight
-    ) {
-      return;
-    }
-
-    const requestedStopId =
-      String(
-        selectedStopId
-      );
-
-    const requestToken =
-      boardRenderToken;
-
-    const stop =
-      findStopById(
-        requestedStopId
-      );
-
-    if (!stop) {
-      return;
-    }
-
-    const refreshButton =
-      document.getElementById(
-        "virtualBoardRefresh"
-      );
-
-    refreshButton?.classList.add(
-      "is-loading"
-    );
-
-    if (refreshButton) {
-      refreshButton.disabled =
-        true;
-    }
-
-    refreshInFlight =
-      true;
-
+    refreshInFlight = true;
     try {
-      const data =
-        await fetchVirtualBoardViaServer(
-          stop
-        );
+      const data = await fetchVirtualBoardViaServer(stop);
+      if (requestToken !== boardRenderToken || selectedStopId !== requestedStopId) return;
 
-      if (
-        requestToken
-          !== boardRenderToken
-        || selectedStopId
-          !== requestedStopId
-      ) {
-        return;
-      }
-
-      const displayedPrimaryArrival =
-        Number(
-          boardPanel()
-            ?.querySelector(
-              ".vb-arrival-minutes"
-            )
-            ?.dataset
-              .arrivalTimestamp
-        );
-
-      if (
-        !force
-        && Number.isFinite(
-          displayedPrimaryArrival
-        )
-        && displayedPrimaryArrival
-          <= Date.now() / 1000
-      ) {
-        lastExpiredPrimaryArrival =
-          displayedPrimaryArrival;
-
-        updateBoardCountdowns();
-
-        return;
-      }
-
-      // IMPORTANT:
-      // Do not rebuild the complete virtual-board panel here.
-      // The header, buttons and event listeners are already present.
-      // Only replace the arrival list. This removes a substantial amount of
-      // synchronous DOM work from every 15-second refresh.
-      renderBoardList(
-        boardPanel(),
-        data
-      );
+      lastBoardData = data;
+      renderBoardList(boardPanel(), data);
     } catch (error) {
-      if (
-        requestToken
-          !== boardRenderToken
-        || selectedStopId
-          !== requestedStopId
-      ) {
-        return;
-      }
+      if (requestToken !== boardRenderToken || selectedStopId !== requestedStopId) return;
 
-      console.error(
-        "Неуспешно зареждане на GTFS-Realtime виртуално табло:",
-        error
-      );
-
-      const list =
-        boardPanel()
-          ?.querySelector(
-            ".virtual-board-list"
-          );
-
-      if (list) {
-        list.innerHTML =
-          `<div class="virtual-board-error">Realtime данните не могат да бъдат заредени.</div>`;
+      console.error('Неуспешно ръчно обновяване на виртуалното табло:', error);
+      const panel = boardPanel();
+      const list = panel?.querySelector('.virtual-board-list');
+      if (lastBoardData) {
+        renderBoardStatus(
+          panel,
+          lastBoardData,
+          lastBoardData.loaded_at,
+          'Обновяването не успя — показваме последните заредени данни.'
+        );
+      } else if (list) {
+        list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Опитайте отново.</div>`;
+        renderBoardStatus(panel, { realtime_status: 'unavailable' }, null, 'Неуспешно зареждане');
       }
     } finally {
-      refreshInFlight =
-        false;
-
-      if (
-        requestToken
-          === boardRenderToken
-        && selectedStopId
-          === requestedStopId
-      ) {
-        const button =
-          document.getElementById(
-            "virtualBoardRefresh"
-          );
-
+      refreshInFlight = false;
+      if (requestToken === boardRenderToken && selectedStopId === requestedStopId) {
+        const button = document.getElementById('virtualBoardRefresh');
         if (button) {
-          button.disabled =
-            false;
-
-          button.classList.remove(
-            "is-loading"
-          );
-
+          button.disabled = false;
+          button.classList.remove('is-loading');
           bindRefreshButton();
         }
       }
-
-      const primaryArrival =
-        boardPanel()
-          ?.querySelector(
-            ".vb-arrival-minutes"
-          )
-          ?.dataset
-            .arrivalTimestamp;
-
-      lastExpiredPrimaryArrival =
-        Number.isFinite(
-          Number(primaryArrival)
-        )
-          ? Number(primaryArrival)
-          : null;
     }
   }
 
@@ -1758,7 +1578,6 @@
         }
       }
 
-      startTimers();
     } catch (error) {
       console.error(
         "Неуспешно зареждане на GTFS за виртуалните табла:",

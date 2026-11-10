@@ -7,7 +7,7 @@ const routesPath = path.join(__dirname, '..', 'data', 'routes.json');
 const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'));
 const byId = new Map(routes.map(route => [route.route_id, route]));
 
-assert.equal(routes.length, 205, 'the current GTFS snapshot should contain 205 routes');
+assert.equal(routes.length, 206, 'the current GTFS snapshot should contain 206 routes');
 assert.equal(normalizeRouteRef('E186'), '186');
 assert.equal(normalizeRouteRef('Е186'), '186');
 assert.equal(normalizeRouteRef('N1'), 'N1');

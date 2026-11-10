@@ -166,7 +166,7 @@ function createDataContext(data = {}) {
 
   // Index each route-direction by its served stops once at service startup.
   // Board requests then visit only routes serving the selected stop instead
-  // of rescanning every route, direction and pattern on every 15s refresh.
+  // of rescanning every route, direction and pattern on every board request.
   const directionsByStop = new Map();
   for (const route of routes) {
     const routeId = String(route?.route_id || '').trim();
@@ -664,6 +664,7 @@ function createDataContext(data = {}) {
           route_ref: meta?.number || candidate.route.route_short_name || '—',
           meta,
           original_trip_id: String(schedule?.original_trip_id || '').trim(),
+          stop_index: stopIndex,
           static_trip_id: String(schedule?.trip_id ?? '').trim(),
           trip_start_time: String(schedule?.start_time || '').trim(),
           times: [{ timestamp, delay: null, scheduled: true, source: 'static' }],
@@ -696,11 +697,12 @@ function createDataContext(data = {}) {
       realtimeTrip?.trip_id || realtimeTrip?.matched_static_trip_id || ''
     ).trim();
 
-    // A real Trip ID is the strongest course identity. It suppresses the
-    // static fallback even when this TripUpdate has no usable prediction at
-    // the selected stop. When GTFS-RT supplies start_time as well (notably for
-    // duplicated trip instances), it is part of the identity too: a second
-    // instance of the same template must not hide the original scheduled run.
+    // A real Trip ID is the strongest course identity. This only establishes
+    // that the TripUpdate refers to this scheduled course; the separate
+    // per-stop coverage check decides whether it replaces the GTFS time.
+    // When GTFS-RT supplies start_time as well (notably for duplicated trip
+    // instances), it is part of the identity too: another instance of the
+    // same template must not hide the original scheduled run.
     if (realtimeTripId) {
       if (!staticOriginalTripIdExact || staticOriginalTripIdExact !== realtimeTripId) return false;
 
@@ -789,23 +791,112 @@ function createDataContext(data = {}) {
     return candidateTripIds.size === 1 && candidateTripIds.has(staticOriginalTripId);
   }
 
-  function staticArrivalIsCovered(staticArrival, realtimeRoutes, realtimeTrips, now, allStaticArrivals) {
-    if (!String(staticArrival?.route_id || '').trim()) return false;
+  function realtimeTripCoversStaticStop(staticArrival, realtimeTrip, selectedStopId, now) {
+    const relationshipName = String(realtimeTrip?.schedule_relationship_name || '').trim().toUpperCase();
+    const relationship = optionalFiniteNumber(realtimeTrip?.schedule_relationship);
 
-    // A matching TripUpdate owns this exact scheduled course. Never let its
-    // static time reappear later, even when the realtime prediction for this
-    // stop is absent, has already passed, or is marked NO_DATA. Otherwise a
-    // stale timetable time can remain on the board until its scheduled time
-    // and temporarily hide the next actual departure. Other courses remain
-    // eligible for the normal static fallback.
-    for (const realtimeTrip of realtimeTrips) {
-      if (staticArrivalMatchesRealtimeDescriptor(staticArrival, realtimeTrip, now, allStaticArrivals)) {
-        return true;
+    // Canceled/deleted scheduled trips must not reappear from the timetable.
+    if (relationshipName === 'CANCELED' || relationshipName === 'DELETED'
+      || relationship === 3 || relationship === 7) {
+      return true;
+    }
+
+    // Only a scheduled TripUpdate can replace a normal GTFS timetable course.
+    if (relationshipName && relationshipName !== 'SCHEDULED') return false;
+    if (relationship !== null && relationship !== 0) return false;
+
+    const routeId = String(staticArrival?.route_id || realtimeTrip?.route_id || '').trim();
+    const originalTripId = String(staticArrival?.original_trip_id || '').trim();
+    const dayType = getScheduleDayType(now, calendar);
+    const staticInfo = findStaticScheduleInfo(routeId, originalTripId, dayType)
+      || (!originalTripId
+        ? findStaticScheduleInfoByStartTime(
+          routeId,
+          staticArrival?.trip_start_time || realtimeTrip?.trip_start_time || realtimeTrip?.start_time,
+          staticArrival?.direction_id || realtimeTrip?.direction_id,
+          dayType
+        )
+        : null);
+    if (!staticInfo) return false;
+
+    const pattern = Array.isArray(staticInfo.direction?.pattern)
+      ? staticInfo.direction.pattern.map(String)
+      : [];
+    const targetIndex = Number.isInteger(staticArrival?.stop_index)
+      ? staticArrival.stop_index
+      : pattern.findIndex(id => stopIdsMatch(id, selectedStopId));
+    if (targetIndex < 0 || targetIndex > staticInfo.terminalIndex) return false;
+
+    // A trip-level delay is valid from the beginning of the trip until a
+    // NO_DATA update clears it. In the absence of such information, a
+    // descriptor alone is not realtime coverage for every stop on the route.
+    // API parser route records contain stop-specific arrivals for the board
+    // stop. Even if that prediction has already passed (and was therefore
+    // omitted from the rendered realtime rows), it still owns this stop and
+    // must prevent the old scheduled time from reappearing.
+    const directStopTimes = Array.isArray(realtimeTrip?.times) ? realtimeTrip.times : [];
+    if (directStopTimes.some(time =>
+      optionalFiniteNumber(time?.timestamp) !== null
+      || optionalFiniteNumber(time?.delay) !== null
+    )) {
+      return true;
+    }
+
+    let knownDelay = optionalFiniteNumber(realtimeTrip?.trip_delay);
+    const updates = (Array.isArray(realtimeTrip?.stop_time_updates) ? realtimeTrip.stop_time_updates : [])
+      .map((update, sourceIndex) => ({
+        update,
+        sourceIndex,
+        stopIndex: getRealtimeUpdateStopIndex(update, staticInfo)
+      }))
+      .filter(item => item.stopIndex >= 0 && item.stopIndex <= targetIndex)
+      .sort((left, right) => left.stopIndex - right.stopIndex || left.sourceIndex - right.sourceIndex);
+
+    for (const item of updates) {
+      const isTargetStop = item.stopIndex === targetIndex;
+      const stopRelationship = optionalFiniteNumber(item.update?.schedule_relationship) ?? 0;
+
+      if (stopRelationship === 2) { // NO_DATA: use the timetable at this stop and downstream until a new event appears.
+        knownDelay = null;
+        if (isTargetStop) return false;
+        continue;
+      }
+
+      if (stopRelationship === 1) { // SKIPPED is handled separately and must not erase delay propagation.
+        if (isTargetStop) return true;
+        continue;
+      }
+
+      const event = getRealtimeEvent(item.update, !isTargetStop);
+      if (!event) continue;
+
+      const eventDelay = getRealtimeEventDelay(event, item.stopIndex, staticInfo.schedule, now);
+      if (eventDelay !== null) knownDelay = eventDelay;
+
+      // A direct target-stop prediction is coverage even when it has already
+      // passed or is outside the display horizon. Otherwise the old timetable
+      // time could reappear as a duplicate arrival.
+      if (isTargetStop) {
+        const directTimestamp = optionalFiniteNumber(event.timestamp);
+        const directDelay = optionalFiniteNumber(event.delay);
+        if (directTimestamp !== null || directDelay !== null) return true;
+        return knownDelay !== null;
       }
     }
 
-    // Be defensive for callers that pass only stop-specific realtime routes
-    // rather than the complete descriptor list produced by the API parser.
+    return knownDelay !== null;
+  }
+
+  function staticArrivalIsCovered(staticArrival, realtimeRoutes, realtimeTrips, now, allStaticArrivals, selectedStopId) {
+    if (!String(staticArrival?.route_id || '').trim()) return false;
+
+    for (const realtimeTrip of realtimeTrips) {
+      if (!staticArrivalMatchesRealtimeDescriptor(staticArrival, realtimeTrip, now, allStaticArrivals)) continue;
+      if (realtimeTripCoversStaticStop(staticArrival, realtimeTrip, selectedStopId, now)) return true;
+    }
+
+    // A stop-specific realtime route already contains a usable arrival for
+    // this selected stop, so it replaces the matching timetable entry.
     for (const realtime of realtimeRoutes) {
       if (staticArrivalMatchesRealtimeDescriptor(staticArrival, realtime, now, allStaticArrivals)) return true;
     }
@@ -868,8 +959,9 @@ function createDataContext(data = {}) {
     const isMetro = /^M/i.test(selectedStopId) || /^M/i.test(String(selectedStop?.stop_code || ''));
     const rawRealtimeRoutes = isMetro ? [] : (Array.isArray(realtimeBoard?.routes) ? realtimeBoard.routes : []);
     // Complete TripUpdate descriptors are supplied separately from arrivals
-    // at this stop. This lets us suppress only the matching static course when
-    // that course exists in realtime but has no prediction for this stop.
+    // at this stop. The service matches the exact course, then checks whether
+    // realtime information reaches this particular stop before replacing its
+    // GTFS timetable time.
     const realtimeTrips = isMetro ? [] : [
       ...(Array.isArray(realtimeBoard?.realtime_trips) ? realtimeBoard.realtime_trips : []),
       ...rawRealtimeRoutes
@@ -1021,7 +1113,7 @@ function createDataContext(data = {}) {
       now
     );
     const staticArrivals = allStaticArrivals.filter(
-      route => !staticArrivalIsCovered(route, realtimeRoutes, realtimeTrips, now, allStaticArrivals)
+      route => !staticArrivalIsCovered(route, realtimeRoutes, realtimeTrips, now, allStaticArrivals, selectedStopId)
     );
 
     const routes = mergeRoutes([...realtimeRoutes, ...staticArrivals]);

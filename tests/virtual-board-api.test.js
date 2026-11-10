@@ -51,6 +51,13 @@ function encodeStopTimeUpdate({ stopId = null, stopSequence = null, relationship
   return Buffer.concat(fields);
 }
 
+function encodeFeedHeader(timestamp) {
+  return Buffer.concat([
+    field(1, 2, text('2.0')),
+    field(3, 0, varint(timestamp))
+  ]);
+}
+
 function encodeTripProperties({ tripId, startDate, startTime }) {
   return Buffer.concat([
     field(1, 2, text(tripId)),
@@ -165,9 +172,9 @@ const predepartureDelayTrip = encodeTripUpdate({
   delay: 90
 });
 
-// An active TripUpdate descriptor owns its exact scheduled course even when
-// it has no usable stop-specific timing. A deleted copy of the same entity is
-// also present below; deleted FeedEntities must not create a second descriptor.
+// An active TripUpdate descriptor identifies its exact scheduled course, but
+// without a usable prediction at or before the selected stop it must not hide
+// that stop's GTFS time. A deleted copy is also present below and must be ignored.
 const activeTripWithoutPrediction = encodeTripUpdate({
   trip: {
     tripId: deletedFallbackCourse.original_trip_id,
@@ -177,7 +184,7 @@ const activeTripWithoutPrediction = encodeTripUpdate({
   }
 });
 
-const feed = Buffer.concat([
+const feedEntities = Buffer.concat([
   field(2, 2, encodeEntity('skipped', skippedTrip)),
   field(2, 2, encodeEntity('skipped-sequence', sequenceSkippedTrip)),
   field(2, 2, encodeEntity('no-data', noDataTrip)),
@@ -185,8 +192,8 @@ const feed = Buffer.concat([
   // A valid TripUpdate may expose a trip-level delay before a stop-specific
   // prediction exists. It must be propagated to a downstream board stop.
   field(2, 2, encodeEntity('predeparture-trip-level-delay', predepartureDelayTrip)),
-  // Exact live trip without a usable prediction at the stop must still
-  // suppress its static fallback so that a stale timetable time cannot return.
+  // A live trip descriptor without a prediction at this stop must not
+  // suppress the timetable; the per-stop GTFS fallback remains available.
   field(2, 2, encodeEntity('realtime-without-stop-prediction', encodeTripUpdate({
     tripProperties: {
       tripId: realtimeOnlyCourse.original_trip_id,
@@ -206,10 +213,26 @@ const feed = Buffer.concat([
   }), true))
 ]);
 
-global.fetch = async () => ({
-  ok: true,
-  arrayBuffer: async () => feed.buffer.slice(feed.byteOffset, feed.byteOffset + feed.byteLength)
-});
+function makeFeed(timestamp = Math.floor(Date.now() / 1000), includeTimestamp = true) {
+  const header = includeTimestamp
+    ? encodeFeedHeader(timestamp)
+    : field(1, 2, text('2.0'));
+  return Buffer.concat([
+    field(1, 2, header),
+    feedEntities
+  ]);
+}
+
+const feed = makeFeed();
+
+let realtimeFetchCount = 0;
+global.fetch = async () => {
+  realtimeFetchCount += 1;
+  return {
+    ok: true,
+    arrayBuffer: async () => feed.buffer.slice(feed.byteOffset, feed.byteOffset + feed.byteLength)
+  };
+};
 
 const req = {
   method: 'GET',
@@ -236,6 +259,8 @@ const res = {
   assert.equal(payload.status === 'ok' || payload.status === 'empty', true);
   assert.ok(Array.isArray(payload.routes), 'the API must return the final board rows');
   assert.equal(typeof payload.generated_at, 'number');
+  assert.equal(payload.realtime_status, 'available');
+  assert.equal(realtimeFetchCount, 1, 'the first manual board load should fetch the realtime feed');
   assert.equal(Object.hasOwn(payload, 'active_trips'), false);
   assert.equal(Object.hasOwn(payload, 'skipped_trips'), false);
 
@@ -257,8 +282,8 @@ const res = {
     .filter(route => route.route_id === 'TB2')
     .flatMap(route => route.times.map(time => Number(time.timestamp)));
   assert.ok(
-    !deletedFallbackTimes.includes(Math.round(deletedFallbackTime)),
-    'an active TripUpdate without a usable stop prediction must suppress its matching static fallback course'
+    deletedFallbackTimes.includes(Math.round(deletedFallbackTime)),
+    'an active TripUpdate without a prediction at or before the selected stop must leave its GTFS fallback visible'
   );
 
   req.query.stop_code = '2082';
@@ -284,6 +309,62 @@ const res = {
     realtimeOnlyTimes.some(time => time > realtimeOnlyTime),
     'other scheduled TB7 trips must remain visible when one trip has realtime but no stop prediction'
   );
+  assert.equal(realtimeFetchCount, 2, 'a subsequent manual refresh must fetch a new feed rather than use a time-based cache');
+
+  // When the upstream realtime service fails, the API still returns a usable
+  // GTFS-only board instead of an HTTP 502.
+  global.fetch = async () => { throw new Error('simulated upstream outage'); };
+  req.query.stop_code = '0605';
+  await handler(req, res);
+  assert.equal(res.statusCode, 200, 'upstream realtime failure must not fail the entire virtual-board request');
+  assert.equal(payload.realtime_status, 'unavailable');
+  assert.match(payload.realtime_message, /показваме разписанието/i);
+  assert.ok(Array.isArray(payload.routes), 'the GTFS fallback must still return board rows');
+  assert.ok(
+    payload.routes.every(route => route.times.every(time => time.scheduled === true)),
+    'when realtime is unavailable, all returned arrival times must be clearly marked as scheduled'
+  );
+  assert.ok(
+    payload.routes.some(route => route.times.length > 0),
+    'an upstream outage must still produce actual timetable arrivals when GTFS has upcoming service'
+  );
+
+  // A feed older than the freshness limit must be treated as unavailable;
+  // fetching it now does not make its old predictions fresh.
+  global.fetch = async () => {
+    const staleFeed = makeFeed(Math.floor(Date.now() / 1000) - 180);
+    return {
+      ok: true,
+      arrayBuffer: async () => staleFeed.buffer.slice(staleFeed.byteOffset, staleFeed.byteOffset + staleFeed.byteLength)
+    };
+  };
+  await handler(req, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(payload.realtime_status, 'unavailable', 'stale realtime snapshots must fall back to GTFS');
+  assert.ok(payload.routes.every(route => route.times.every(time => time.scheduled === true)));
+
+  // Missing feed timestamps are unknown freshness, not permission to stamp
+  // the payload with the current server time and present it as realtime.
+  global.fetch = async () => {
+    const untimestampedFeed = makeFeed(0, false);
+    return {
+      ok: true,
+      arrayBuffer: async () => untimestampedFeed.buffer.slice(untimestampedFeed.byteOffset, untimestampedFeed.byteOffset + untimestampedFeed.byteLength)
+    };
+  };
+  await handler(req, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(payload.realtime_status, 'unavailable', 'a feed without timestamp must use the GTFS fallback');
+  assert.ok(payload.routes.every(route => route.times.every(time => time.scheduled === true)));
+
+  // Metro is schedule-only; it must not make an upstream realtime request.
+  let metroFetchCount = 0;
+  global.fetch = async () => { metroFetchCount += 1; throw new Error('metro must not request realtime'); };
+  req.query.stop_code = 'M1';
+  await handler(req, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(payload.realtime_status, 'not_applicable');
+  assert.equal(metroFetchCount, 0, 'metro boards must use GTFS without requesting the realtime feed');
 
   console.log('virtual-board-api: all tests passed');
 })().catch(error => {

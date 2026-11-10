@@ -52,5 +52,12 @@ for (const [offset, expected, label] of cases) {
 }
 
 assert.equal(formatArrivalCountdown('not-a-timestamp', now), '', 'invalid timestamps should render as an empty label');
+assert.equal(
+  formatArrivalCountdown(now + 541, now),
+  formatArrivalCountdown(now + 541, now),
+  'the same arrival must keep the same displayed minutes while the board snapshot timestamp is unchanged'
+);
+assert.doesNotMatch(source, /\bsetInterval\s*\(/, 'virtual boards must not start periodic refresh or countdown timers');
+assert.doesNotMatch(source, /updateBoardCountdowns|startTimers|data-arrival-timestamp/, 'automatic minute updates and their DOM hooks must be removed');
 
 console.log('virtual-board-arrivals: presentation tests passed');

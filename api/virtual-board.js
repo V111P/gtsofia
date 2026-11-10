@@ -1,12 +1,11 @@
 const { buildVirtualBoard } = require('./virtual-board-service');
 const tripsData = require('../data/trips.json');
+const stopsData = require('../data/stops.json');
 
 const FEED_URL = 'https://gtfs.sofiatraffic.bg/api/v1/trip-updates';
 const FEED_TIMEOUT_MS = 15000;
-
-// The browser refreshes the board every 15 seconds.
-// Keep the decoded feed for the same period on a warm serverless instance.
-const FEED_CACHE_TTL_MS = 15000;
+const MAX_FEED_AGE_SECONDS = 120;
+const MAX_FEED_FUTURE_SKEW_SECONDS = 60;
 
 const MAX_RESULTS_PER_ROUTE = 3;
 const LOOK_AHEAD_SECONDS = 2 * 60 * 60;
@@ -24,12 +23,8 @@ for (const trip of tripsData) {
   }
 }
 
-// Vercel may reuse the same serverless instance between requests.
-// Reuse the decoded feed instead of downloading and decoding it again.
-let feedCache = null;
-
-// When multiple board requests arrive at the same time, make only one
-// upstream request and let the other requests await the same Promise.
+// Simultaneous requests may share one upstream download. The result is not
+// retained after the request: a manual refresh must always request a fresh feed.
 let feedFetchPromise = null;
 
 // GTFS-Realtime TripDescriptor.schedule_relationship.
@@ -647,11 +642,7 @@ function decodeGtfsRealtimeFeed(buffer) {
 
   return {
     updates,
-    feedTimestamp:
-      feedTimestamp
-      || Math.floor(
-        Date.now() / 1000
-      )
+    feedTimestamp
   };
 }
 
@@ -869,10 +860,9 @@ function buildBoard(
     new Map();
 
   // Keep every current TripUpdate descriptor and its timing updates, even
-  // when it has no StopTimeUpdate for the selected stop. The service uses the
-  // trip-level delay and prior stop updates to propagate a prediction forward,
-  // and suppresses the static fallback for this exact course so a stale
-  // timetable time cannot reappear after its realtime arrival has passed.
+  // when it has no StopTimeUpdate for the selected stop. The service checks
+  // whether trip-level delay or an upstream StopTimeUpdate actually covers
+  // this stop. A descriptor by itself must not hide the GTFS fallback.
   const realtimeTrips = new Map();
 
   for (
@@ -1040,13 +1030,13 @@ function buildBoard(
       const scheduledTime = eventScheduledTime(stopUpdate);
 
       // Some producers send scheduled_time + delay but omit absolute time.
-      // Keep the record so the service can calculate a prediction or, at a
-      // minimum, suppress fallback for this same TripUpdate.
-      if (timestamp === null && scheduledTime !== null) {
-        timestamp = delay !== null ? scheduledTime + delay : scheduledTime;
+      // That pair is a usable prediction. scheduled_time by itself is only a
+      // timetable value, not evidence of realtime coverage at this stop.
+      if (timestamp === null && scheduledTime !== null && delay !== null) {
+        timestamp = scheduledTime + delay;
       }
 
-      if (timestamp === null && delay === null && scheduledTime === null) continue;
+      if (timestamp === null && delay === null) continue;
       if (timestamp !== null && timestamp < now - REALTIME_PAST_GRACE_SECONDS) continue;
       if (timestamp !== null && timestamp > now + LOOK_AHEAD_SECONDS) continue;
 
@@ -1223,7 +1213,8 @@ async function fetchRealtimeFeed() {
               'application/x-protobuf, application/octet-stream',
             'User-Agent':
               'GTSofia virtual boards'
-          }
+          },
+          cache: 'no-store'
         }
       );
 
@@ -1244,9 +1235,22 @@ async function fetchRealtimeFeed() {
       );
     }
 
-    return decodeGtfsRealtimeFeed(
-      body
-    );
+    const feed = decodeGtfsRealtimeFeed(body);
+    const feedTimestamp = Number(feed.feedTimestamp);
+    if (!Number.isSafeInteger(feedTimestamp) || feedTimestamp <= 0) {
+      throw new Error('GTFS-RT feed has no valid timestamp; realtime freshness is unknown.');
+    }
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const ageSeconds = nowSeconds - feedTimestamp;
+    if (ageSeconds > MAX_FEED_AGE_SECONDS) {
+      throw new Error(`GTFS-RT feed is stale (${ageSeconds}s old).`);
+    }
+    if (ageSeconds < -MAX_FEED_FUTURE_SKEW_SECONDS) {
+      throw new Error('GTFS-RT feed timestamp is too far in the future.');
+    }
+
+    return feed;
   } finally {
     clearTimeout(
       timeout
@@ -1255,40 +1259,32 @@ async function fetchRealtimeFeed() {
 }
 
 async function getRealtimeFeed() {
-  const now =
-    Date.now();
+  // Do not cache between manual refreshes. Coalesce only requests that are
+  // genuinely concurrent, then discard the Promise so the next click fetches
+  // a fresh upstream snapshot.
+  if (feedFetchPromise) return feedFetchPromise;
 
-  // Fast path for a warm serverless instance.
-  if (
-    feedCache
-    && now - feedCache.cachedAt
-      < FEED_CACHE_TTL_MS
-  ) {
-    return feedCache.feed;
-  }
-
-  // Prevent duplicate simultaneous upstream downloads.
-  if (feedFetchPromise) {
-    return feedFetchPromise;
-  }
-
-  feedFetchPromise =
-    fetchRealtimeFeed()
-      .then(feed => {
-        feedCache = {
-          feed,
-          cachedAt:
-            Date.now()
-        };
-
-        return feed;
-      })
-      .finally(() => {
-        feedFetchPromise =
-          null;
-      });
+  feedFetchPromise = fetchRealtimeFeed().finally(() => {
+    feedFetchPromise = null;
+  });
 
   return feedFetchPromise;
+}
+
+function isMetroStop(stopCode) {
+  const raw = String(stopCode ?? '').trim();
+  const stop = stopsData.find(item =>
+    String(item?.stop_id ?? '').trim() === raw
+    || String(item?.stop_code ?? '').trim() === raw
+  );
+  return /^M/i.test(String(stop?.stop_id || raw))
+    || /^M/i.test(String(stop?.stop_code || ''));
+}
+
+function setBoardResponseHeaders(res) {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  res.setHeader('Access-Control-Allow-Origin', '*');
 }
 
 module.exports =
@@ -1327,57 +1323,54 @@ module.exports =
         });
     }
 
-    try {
-      const feed =
-        await getRealtimeFeed();
+    const now = new Date();
+    const metro = isMetroStop(stopCode);
+    let realtimeBoard = {
+      status: 'empty',
+      stop_code: stopCode,
+      generated_at: null,
+      skipped_trips: [],
+      realtime_trips: [],
+      routes: []
+    };
+    let realtimeStatus = metro ? 'not_applicable' : 'available';
+    let realtimeMessage = '';
+    let realtimeFeedTimestamp = null;
 
-      const realtimeBoard =
-        buildBoard(
+    if (!metro) {
+      try {
+        const feed = await getRealtimeFeed();
+        realtimeFeedTimestamp = feed.feedTimestamp;
+        realtimeBoard = buildBoard(
           feed.updates,
           stopCode,
           feed.feedTimestamp
         );
+      } catch (error) {
+        realtimeStatus = 'unavailable';
+        realtimeMessage = 'Realtime информацията временно не е налична — показваме разписанието.';
+        const detail = error?.name === 'AbortError'
+          ? 'Sofia Traffic GTFS-RT request timed out.'
+          : (error?.message || 'Unable to fetch/decode GTFS-RT.');
+        console.warn(`GTSofia realtime fallback for stop ${stopCode}: ${detail}`);
+      }
+    } else {
+      realtimeMessage = 'За метрото се използва разписанието.';
+    }
 
-      const board =
-        buildVirtualBoard(
-          realtimeBoard,
-          stopCode
-        );
-
-      res.setHeader(
-        "Content-Type",
-        "application/json; charset=utf-8"
-      );
-
-      // Browser must request the current board.
-      // This does not disable our server-side in-memory feed cache.
-      res.setHeader(
-        "Cache-Control",
-        "no-store, max-age=0"
-      );
-
-      res.setHeader(
-        "Access-Control-Allow-Origin",
-        "*"
-      );
-
-      return res
-        .status(200)
-        .json(board);
+    try {
+      const board = buildVirtualBoard(realtimeBoard, stopCode, now);
+      setBoardResponseHeaders(res);
+      return res.status(200).json({
+        ...board,
+        realtime_status: realtimeStatus,
+        realtime_message: realtimeMessage,
+        realtime_feed_timestamp: realtimeFeedTimestamp,
+        refreshed_at: Math.floor(Date.now() / 1000)
+      });
     } catch (error) {
-      const message =
-        error?.name ===
-        "AbortError"
-          ? "Sofia Traffic GTFS-RT request timed out."
-          : (
-              error?.message
-              || "Unable to fetch/decode GTFS-RT."
-            );
-
-      return res
-        .status(502)
-        .json({
-          error: message
-        });
+      const message = error?.message || 'Unable to build the virtual board.';
+      setBoardResponseHeaders(res);
+      return res.status(500).json({ error: message });
     }
   };
