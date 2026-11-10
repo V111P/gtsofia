@@ -4,38 +4,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 GTFS_URL = "https://gtfs.sofiatraffic.bg/api/v1/static"
-# maps.mail.ru's Overpass endpoint has had repeated availability/permission
-# problems. Keep a primary endpoint and multiple public fallbacks so an
-# outage cannot silently turn the generated stop names back into GTFS names.
-OSM_URL = "https://overpass.private.coffee/api/interpreter"
-OSM_FALLBACK_URLS = (
-    "https://lz4.overpass-api.de/api/interpreter",
-    "https://overpass-api.de/api/interpreter",
-)
+OSM_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 OSM_NETWORK_NAME = "Градски транспорт София"
-# Keep the older two-column setting for callers which import it, but use the
-# explicit filters below to match the actual OSM tagging conventions.
 OSM_STOP_TYPES = (
     ("subway", "station"),
     ("tram", "stop_position"),
     ("bus", "platform"),
     ("trolleybus", "platform"),
 )
-OSM_STOP_FILTERS = (
-    # Subway stations are commonly mapped with railway=station, not
-    # public_transport=station. Retain the latter for older mapped objects.
-    ("station", "subway", "railway", "station"),
-    ("subway", "yes", "railway", "station"),
-    ("subway", "yes", "public_transport", "station"),
-    ("tram", "yes", "public_transport", "stop_position"),
-    ("tram", "yes", "railway", "tram_stop"),
-    ("bus", "yes", "public_transport", "platform"),
-    ("bus", "yes", "highway", "bus_stop"),
-    ("trolleybus", "yes", "public_transport", "platform"),
-)
-# Match the repository's existing data-quality test: fewer than 3,000 named
-# OSM records is treated as an incomplete fetch, not as a new source of truth.
-OSM_MIN_NAMED_STOPS = 3000
 
 # This file lives in Scripts/transport_data/, so the repository root is
 # two levels above the package directory.
@@ -86,12 +62,8 @@ def normalize_osm_stop_code(tags):
     if not ref:
         return ""
 
-    is_subway = (
-        normalize(tags.get("subway")).lower() == "yes"
-        or normalize(tags.get("station")).lower() == "subway"
-    )
-    if is_subway:
-        return f"M{ref[1:]}" if ref.upper().startswith("M") else f"M{ref}"
+    if normalize(tags.get("subway")).lower() == "yes":
+        return f"M{ref}"
 
     return ref.zfill(4)
 

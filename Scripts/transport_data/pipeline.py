@@ -5,7 +5,7 @@ from .config import DATA_DIR, GTFS_DIR, get_today, normalize
 from .gtfs import download_gtfs, read_csv
 from .osm import (
     fetch_osm_stops, enrich_stops_with_osm,
-    load_previous_osm_stops, resolve_osm_stop_snapshot,
+    load_previous_osm_stops, merge_osm_stop_snapshots,
 )
 from .calendar import load_calendar_config, build_calendar_context
 from .stops import build_stops
@@ -104,15 +104,21 @@ def main():
 
         # Keep the last known-good names when Overpass fails or returns only
         # a partial set. A temporary OSM outage must never turn every display
-        # name back into the uppercase GTFS variant. With no complete previous
-        # snapshot, stop generation before any output file can be overwritten.
-        osm_stops, accepted_fetched_osm_stops = resolve_osm_stop_snapshot(
+        # name back into the uppercase GTFS variant.
+        osm_stops = merge_osm_stop_snapshots(
             fetched_osm_stops,
             previous_osm_stops,
         )
-        if accepted_fetched_osm_stops is None:
+        if fetched_osm_stops is None:
             print(
-                "WARNING: Reusing the previous complete OSM stop-name snapshot."
+                "WARNING: Reusing previous OSM stop names because the OSM "
+                "request failed."
+            )
+        elif len(fetched_osm_stops) < len(previous_osm_stops):
+            print(
+                "WARNING: OSM returned fewer stop records than the previous "
+                f"snapshot ({len(fetched_osm_stops)} vs {len(previous_osm_stops)}); "
+                "previous names are retained for missing stops."
             )
         print(
             "OSM stop-name records available after merge: "
@@ -280,7 +286,7 @@ def main():
             "osmSource": "OpenStreetMap — Градски транспорт София",
             "osmUpdatedAt": (
                 today.isoformat()
-                if accepted_fetched_osm_stops is not None
+                if fetched_osm_stops is not None and fetched_osm_stops
                 else load_previous_osm_updated_at()
             ),
             "calendar": calendar_result,
