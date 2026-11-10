@@ -11,6 +11,12 @@
   let stopMarkersById = new Map();
   let transportData = null;
   let lastBoardData = null;
+  let boardAutoRefreshTimer = null;
+  let boardAutoRefreshFailures = 0;
+  let boardInitialLoadInFlight = false;
+  const BOARD_AUTO_REFRESH_INTERVAL_MS = 30_000;
+  const BOARD_AUTO_REFRESH_STATIC_INTERVAL_MS = 60_000;
+  const BOARD_AUTO_REFRESH_MAX_INTERVAL_MS = 120_000;
   const REALTIME_ARRIVAL_HISTORY_KEY = 'gtsofia.virtualBoard.realtimeArrivalHistory.v1';
   const REALTIME_ARRIVAL_HISTORY_TTL_SECONDS = 36 * 60 * 60;
   let realtimeArrivalHistoryMemory = [];
@@ -119,7 +125,8 @@
     if (!left || !right) return false;
     if (left.stop_id !== right.stop_id || left.route_id !== right.route_id) return false;
 
-    if (left.trip_id && right.trip_id) {
+    const hasSharedTripId = Boolean(left.trip_id && right.trip_id);
+    if (hasSharedTripId) {
       if (left.trip_id !== right.trip_id) return false;
     } else if (!left.trip_start_time || !right.trip_start_time
       || left.trip_start_time !== right.trip_start_time) {
@@ -130,10 +137,64 @@
       && left.trip_start_date !== right.trip_start_date) return false;
     if (left.trip_start_time && right.trip_start_time
       && left.trip_start_time !== right.trip_start_time) return false;
-    if (left.direction_id && right.direction_id
+
+    // When the real GTFS Trip ID and start time match, they are a stronger
+    // identity than direction_id. Some feeds encode direction_id differently
+    // (or omit it) between a TripUpdate and the corresponding timetable row.
+    // Keep direction as a discriminator only for the time-only fallback.
+    if (!hasSharedTripId && left.direction_id && right.direction_id
       && left.direction_id !== right.direction_id) return false;
 
     return true;
+  }
+
+  function getArrivalHistoryKey(identity) {
+    if (!identity) return '';
+    const tripIdentity = identity.trip_id
+      ? `trip:${identity.trip_id}`
+      : `start:${identity.trip_start_time}`;
+    const directionIdentity = identity.trip_id ? '' : identity.direction_id;
+    return [
+      identity.stop_id,
+      identity.route_id,
+      tripIdentity,
+      identity.trip_start_date,
+      identity.trip_start_time,
+      directionIdentity
+    ].join('|');
+  }
+
+  function getRouteFirstArrivalTimestamp(route) {
+    const timestamps = (Array.isArray(route?.times) ? route.times : [])
+      .filter(time => time?.timestamp !== null && time?.timestamp !== undefined && time?.timestamp !== '')
+      .map(time => Number(time.timestamp))
+      .filter(Number.isFinite);
+    return timestamps.length ? Math.min(...timestamps) : Number.POSITIVE_INFINITY;
+  }
+
+  function sortBoardRoutesByNextArrival(routes) {
+    return (Array.isArray(routes) ? routes : [])
+      .map(route => ({
+        ...route,
+        times: (Array.isArray(route?.times) ? route.times : [])
+          .slice()
+          .sort((left, right) => Number(left?.timestamp) - Number(right?.timestamp))
+      }))
+      .sort((left, right) => {
+        const timeDifference = getRouteFirstArrivalTimestamp(left)
+          - getRouteFirstArrivalTimestamp(right);
+        if (timeDifference) return timeDifference;
+
+        const lineDifference = String(left?.route_ref || left?.meta?.number || '')
+          .localeCompare(String(right?.route_ref || right?.meta?.number || ''), 'bg', { numeric: true });
+        if (lineDifference) return lineDifference;
+
+        const destinationDifference = String(left?.destination || left?.headsign || '')
+          .localeCompare(String(right?.destination || right?.headsign || ''), 'bg');
+        if (destinationDifference) return destinationDifference;
+
+        return String(left?.route_id || '').localeCompare(String(right?.route_id || ''));
+      });
   }
 
   function readRealtimeArrivalHistory(nowSeconds = Date.now() / 1000) {
@@ -158,14 +219,7 @@
     for (const item of combined) {
       const identity = item?.identity;
       if (!identity) continue;
-      const key = [
-        identity.stop_id,
-        identity.route_id,
-        identity.trip_id,
-        identity.trip_start_date,
-        identity.trip_start_time,
-        identity.direction_id
-      ].join('|');
+      const key = getArrivalHistoryKey(identity);
       const existing = unique.get(key);
       if (!existing || Number(item.remembered_at) >= Number(existing.remembered_at)) {
         unique.set(key, item);
@@ -202,7 +256,31 @@
         if (!identity) continue;
 
         const matchingIndex = next.findIndex(item => sameArrivalTrip(item.identity, identity));
-        const record = { identity, timestamp, remembered_at: nowSeconds };
+        const previous = matchingIndex >= 0 ? next[matchingIndex] : null;
+        const previousEarliest = Number(previous?.earliest_timestamp ?? previous?.timestamp);
+        const earliestTimestamp = Number.isFinite(previousEarliest)
+          ? Math.min(previousEarliest, timestamp)
+          : timestamp;
+        const previousPassedAt = previous?.passed_at === null || previous?.passed_at === undefined
+          ? null
+          : Number(previous.passed_at);
+        const passedAt = previousPassedAt !== null && Number.isFinite(previousPassedAt)
+          ? previousPassedAt
+          : (earliestTimestamp <= nowSeconds ? nowSeconds : null);
+        const record = {
+          identity: {
+            ...(previous?.identity || {}),
+            ...identity,
+            // Preserve a known identity field if this refresh omits it.
+            trip_start_date: identity.trip_start_date || previous?.identity?.trip_start_date || '',
+            trip_start_time: identity.trip_start_time || previous?.identity?.trip_start_time || '',
+            direction_id: identity.direction_id || previous?.identity?.direction_id || ''
+          },
+          timestamp,
+          earliest_timestamp: earliestTimestamp,
+          passed_at: passedAt,
+          remembered_at: nowSeconds
+        };
         if (matchingIndex >= 0) next[matchingIndex] = record;
         else next.push(record);
       }
@@ -223,10 +301,15 @@
           const identity = getArrivalTripIdentity(route, time, stopId);
           if (!identity) return true;
 
-          const wasPredictedRealtime = history.some(item =>
-            sameArrivalTrip(item.identity, identity)
-            && Number(item.timestamp) <= nowSeconds
-          );
+          const wasPredictedRealtime = history.some(item => {
+            if (!sameArrivalTrip(item.identity, identity)) return false;
+            const earliestTimestamp = Number(item.earliest_timestamp ?? item.timestamp);
+            const hasPassedAt = item?.passed_at !== null
+              && item?.passed_at !== undefined
+              && Number.isFinite(Number(item.passed_at));
+            return hasPassedAt
+              || (Number.isFinite(earliestTimestamp) && earliestTimestamp <= nowSeconds);
+          });
           if (wasPredictedRealtime) removedAny = true;
           return !wasPredictedRealtime;
         });
@@ -237,7 +320,10 @@
     return {
       ...boardData,
       status: routes.length ? (boardData?.status || 'ok') : 'empty',
-      routes,
+      // Client-side suppression can remove the first course from a grouped
+      // line row. Re-sort after that removal so a line whose next remaining
+      // course is later cannot stay above another line with an earlier arrival.
+      routes: sortBoardRoutesByNextArrival(routes),
       passed_realtime_fallbacks_suppressed: removedAny
     };
   }
@@ -338,7 +424,7 @@
       seconds - nowSeconds;
 
     // Minutes are calculated once from the board's load timestamp. They stay
-    // fixed until the user explicitly presses the refresh button.
+    // fixed until the next automatic or manual board refresh.
     // Arrival has reached the stop.
     if (remainingSeconds <= 0) {
       return "0 мин.";
@@ -529,7 +615,7 @@
 
     // Remember the last realtime prediction for each exact trip. Some feeds
     // remove a vehicle as soon as it has passed the selected stop; on the next
-    // manual refresh that same trip can otherwise reappear from GTFS with its
+    // refresh that same trip can otherwise reappear from GTFS with its
     // later scheduled time (e.g. actual 14:39 vs timetable 14:42).
     rememberRealtimeArrivalPredictions(normalized, stopCode, normalized.loaded_at);
     return suppressPassedRealtimeFallbacks(normalized, stopCode, normalized.loaded_at);
@@ -545,45 +631,109 @@
 
     button.onclick =
       () =>
-        refreshSelectedBoard();
+        refreshSelectedBoard({ automatic: false });
   }
 
-  function formatBoardUpdatedAt(timestamp) {
-    const seconds = Number(timestamp);
-    if (!Number.isFinite(seconds)) return '—';
-    return new Intl.DateTimeFormat('bg-BG', {
-      timeZone: SOFIA_TIME_ZONE,
-      hour: '2-digit',
-      minute: '2-digit',
-      hourCycle: 'h23'
-    }).format(new Date(seconds * 1000));
+  function clearBoardAutoRefreshTimer() {
+    if (boardAutoRefreshTimer !== null) {
+      window.clearTimeout(boardAutoRefreshTimer);
+      boardAutoRefreshTimer = null;
+    }
   }
 
-  function renderBoardStatus(panel, data, snapshotSeconds, warning = '') {
+  function getBoardAutoRefreshDelay() {
+    // Metro is schedule-only and does not need a frequent realtime poll.
+    if (lastBoardData?.realtime_status === 'not_applicable') {
+      return BOARD_AUTO_REFRESH_STATIC_INTERVAL_MS;
+    }
+
+    const backoffMultiplier = 2 ** Math.min(boardAutoRefreshFailures, 2);
+    return Math.min(
+      BOARD_AUTO_REFRESH_INTERVAL_MS * backoffMultiplier,
+      BOARD_AUTO_REFRESH_MAX_INTERVAL_MS
+    );
+  }
+
+  function recordBoardRefreshOutcome(data = null, error = null) {
+    if (error || data?.realtime_status === 'unavailable') {
+      boardAutoRefreshFailures = Math.min(boardAutoRefreshFailures + 1, 2);
+      return;
+    }
+
+    if (data) {
+      boardAutoRefreshFailures = 0;
+      lastBoardData = data;
+    }
+  }
+
+  function canAutoRefreshBoard() {
+    return Boolean(selectedStopId)
+      && document.visibilityState !== 'hidden'
+      && Boolean(boardPanel()?.querySelector('.virtual-board-header'));
+  }
+
+  function scheduleBoardAutoRefresh(delayMs = getBoardAutoRefreshDelay()) {
+    clearBoardAutoRefreshTimer();
+    if (!canAutoRefreshBoard()) return;
+
+    boardAutoRefreshTimer = window.setTimeout(() => {
+      boardAutoRefreshTimer = null;
+      if (!canAutoRefreshBoard()) return;
+
+      // Never overlap requests. If an initial or manual request is still active,
+      // retry the scheduling decision shortly instead of starting another call.
+      if (refreshInFlight || boardInitialLoadInFlight) {
+        scheduleBoardAutoRefresh(5_000);
+        return;
+      }
+
+      refreshSelectedBoard({ automatic: true });
+    }, delayMs);
+  }
+
+  function stopBoardAutoRefresh() {
+    clearBoardAutoRefreshTimer();
+    boardAutoRefreshFailures = 0;
+  }
+
+  function handleBoardVisibilityChange() {
+    if (document.visibilityState === 'hidden') {
+      clearBoardAutoRefreshTimer();
+      return;
+    }
+
+    if (!selectedStopId) return;
+    clearBoardAutoRefreshTimer();
+
+    if (refreshInFlight || boardInitialLoadInFlight) {
+      scheduleBoardAutoRefresh(5_000);
+      return;
+    }
+
+    // Refresh once when the user returns to the tab; the regular schedule
+    // resumes only after that request completes.
+    refreshSelectedBoard({ automatic: true });
+  }
+
+  function renderBoardStatus(panel, data, warning = '') {
     const statusElement = panel?.querySelector('.vb-board-status');
     if (!statusElement) return;
 
     const realtimeStatus = String(data?.realtime_status || 'available');
-    let label = '';
-    let statusClass = 'is-live';
-
-    if (realtimeStatus === 'unavailable') {
-      label = data?.realtime_message || 'Realtime временно недостъпен — показваме разписанието.';
-      statusClass = 'is-warning';
-    }
+    const label = realtimeStatus === 'unavailable'
+      ? (data?.realtime_message || 'Realtime временно недостъпен — показваме разписанието.')
+      : '';
 
     if (warning) {
       statusElement.innerHTML = `
         <span class="vb-board-status-label is-warning">${escapeHtml(warning)}</span>
-        <span class="vb-board-updated">Последно успешно зареждане: ${escapeHtml(formatBoardUpdatedAt(snapshotSeconds))}</span>
       `;
       return;
     }
 
-    statusElement.innerHTML = `
-      ${label ? `<span class="vb-board-status-label ${statusClass}">${escapeHtml(label)}</span>` : ''}
-      <span class="vb-board-updated">Обновено: ${escapeHtml(formatBoardUpdatedAt(snapshotSeconds))}</span>
-    `;
+    statusElement.innerHTML = label
+      ? `<span class="vb-board-status-label is-warning">${escapeHtml(label)}</span>`
+      : '';
   }
 
   function renderBoardList(
@@ -598,7 +748,7 @@
     if (!list) return;
 
     const snapshotSeconds = Number(data?.loaded_at) || Date.now() / 1000;
-    renderBoardStatus(panel, data, snapshotSeconds);
+    renderBoardStatus(panel, data);
 
     if (
       data.status !== "ok"
@@ -612,9 +762,9 @@
 
     // The API owns timetable selection, realtime/static merging, destination
     // resolution, deduplication and ordering. The browser only renders rows.
-    const rows = data.routes.filter(
+    const rows = sortBoardRoutesByNextArrival(data.routes.filter(
       route => Array.isArray(route?.times) && route.times.length > 0
-    );
+    ));
 
     if (!rows.length) {
       list.innerHTML =
@@ -707,6 +857,9 @@
     stop,
     boardData = null
   ) {
+    stopBoardAutoRefresh();
+    boardInitialLoadInFlight = true;
+
     const renderToken =
       ++boardRenderToken;
 
@@ -719,7 +872,10 @@
     const panel =
       boardPanel();
 
-    if (!panel) return;
+    if (!panel) {
+      boardInitialLoadInFlight = false;
+      return;
+    }
 
     panel.innerHTML = `
       <div class="virtual-board-header">
@@ -771,6 +927,8 @@
         "click",
         () => {
           ++boardRenderToken;
+          stopBoardAutoRefresh();
+          boardInitialLoadInFlight = false;
 
           selectedStopId =
             null;
@@ -858,6 +1016,7 @@
       }
 
       lastBoardData = data;
+      recordBoardRefreshOutcome(data);
       renderBoardList(
         panel,
         data
@@ -878,12 +1037,13 @@
         "Realtime virtual board error:",
         error
       );
+      recordBoardRefreshOutcome(null, error);
 
       const list = panel.querySelector('.virtual-board-list');
       if (list) {
-        list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Опитайте отново с бутона за обновяване.</div>`;
+        list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Ще опитаме отново автоматично.</div>`;
       }
-      renderBoardStatus(panel, { realtime_status: 'unavailable' }, null, 'Неуспешно зареждане');
+      renderBoardStatus(panel, { realtime_status: 'unavailable' }, 'Неуспешно зареждане');
     } finally {
       if (
         renderToken
@@ -896,6 +1056,7 @@
         return;
       }
 
+      boardInitialLoadInFlight = false;
       const refreshButton =
         document.getElementById(
           "virtualBoardRefresh"
@@ -911,6 +1072,7 @@
 
         bindRefreshButton();
       }
+      scheduleBoardAutoRefresh();
     }
   }
 
@@ -1649,8 +1811,14 @@
     );
   }
 
-  async function refreshSelectedBoard() {
-    if (!selectedStopId || refreshInFlight) return;
+  async function refreshSelectedBoard({ automatic = false } = {}) {
+    if (!selectedStopId) return;
+    clearBoardAutoRefreshTimer();
+
+    if (refreshInFlight || boardInitialLoadInFlight) {
+      scheduleBoardAutoRefresh(5_000);
+      return;
+    }
 
     const requestedStopId = String(selectedStopId);
     const requestToken = boardRenderToken;
@@ -1667,23 +1835,26 @@
       if (requestToken !== boardRenderToken || selectedStopId !== requestedStopId) return;
 
       lastBoardData = data;
+      recordBoardRefreshOutcome(data);
       renderBoardList(boardPanel(), data);
     } catch (error) {
       if (requestToken !== boardRenderToken || selectedStopId !== requestedStopId) return;
 
-      console.error('Неуспешно ръчно обновяване на виртуалното табло:', error);
+      console.error('Неуспешно обновяване на виртуалното табло:', error);
+      recordBoardRefreshOutcome(null, error);
       const panel = boardPanel();
       const list = panel?.querySelector('.virtual-board-list');
       if (lastBoardData) {
         renderBoardStatus(
           panel,
           lastBoardData,
-          lastBoardData.loaded_at,
-          'Обновяването не успя — показваме последните заредени данни.'
+          automatic
+            ? 'Временно няма връзка — показваме последните заредени данни.'
+            : 'Обновяването не успя — показваме последните заредени данни.'
         );
       } else if (list) {
-        list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Опитайте отново.</div>`;
-        renderBoardStatus(panel, { realtime_status: 'unavailable' }, null, 'Неуспешно зареждане');
+        list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Ще опитаме отново автоматично.</div>`;
+        renderBoardStatus(panel, { realtime_status: 'unavailable' }, 'Неуспешно зареждане');
       }
     } finally {
       refreshInFlight = false;
@@ -1695,6 +1866,7 @@
           bindRefreshButton();
         }
       }
+      scheduleBoardAutoRefresh();
     }
   }
 
@@ -1765,6 +1937,11 @@
   }
 
   document.addEventListener(
+    "visibilitychange",
+    handleBoardVisibilityChange
+  );
+
+  document.addEventListener(
     "DOMContentLoaded",
     initializeVirtualBoards
   );
@@ -1773,6 +1950,12 @@
   globalThis.__gtsofiaVirtualBoardTestInternals = {
     formatArrivalCountdown,
     rememberRealtimeArrivalPredictions,
-    suppressPassedRealtimeFallbacks
+    suppressPassedRealtimeFallbacks,
+    sameArrivalTrip,
+    sortBoardRoutesByNextArrival,
+    getBoardAutoRefreshDelay,
+    recordBoardRefreshOutcome,
+    scheduleBoardAutoRefresh,
+    clearBoardAutoRefreshTimer
   };
 })();

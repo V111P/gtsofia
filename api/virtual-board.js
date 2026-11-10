@@ -24,7 +24,7 @@ for (const trip of tripsData) {
 }
 
 // Simultaneous requests may share one upstream download. The result is not
-// retained after the request: a manual refresh must always request a fresh feed.
+// retained after the request: each scheduled or manual refresh gets a fresh feed.
 let feedFetchPromise = null;
 
 // GTFS-Realtime TripDescriptor.schedule_relationship.
@@ -1259,9 +1259,9 @@ async function fetchRealtimeFeed() {
 }
 
 async function getRealtimeFeed() {
-  // Do not cache between manual refreshes. Coalesce only requests that are
-  // genuinely concurrent, then discard the Promise so the next click fetches
-  // a fresh upstream snapshot.
+  // Do not retain a feed snapshot between refreshes. Coalesce only requests
+  // that are genuinely concurrent, then discard the Promise so the next
+  // scheduled or manual refresh fetches a fresh upstream snapshot.
   if (feedFetchPromise) return feedFetchPromise;
 
   feedFetchPromise = fetchRealtimeFeed().finally(() => {

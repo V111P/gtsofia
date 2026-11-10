@@ -813,7 +813,15 @@ VIRTUAL BOARDS
   height: 9px;
   border-radius: 50%;
   background: #16a34a;
+  box-shadow: 0 0 0 0 rgba(22, 163, 74, .45);
+  animation: vb-pulse 1.8s infinite;
   flex: 0 0 9px;
+}
+
+@keyframes vb-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(22, 163, 74, .45); }
+  70% { box-shadow: 0 0 0 7px rgba(22, 163, 74, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0); }
 }
 
 .virtual-board-layout {
@@ -1100,10 +1108,13 @@ VIRTUAL BOARDS
   flex-wrap: wrap;
   align-items: center;
   gap: 4px 9px;
-  min-height: 16px;
   color: #6b7280;
   font-size: 11px;
   line-height: 1.35;
+}
+
+.vb-board-status:empty {
+  display: none;
 }
 
 .vb-board-status-label {
@@ -1114,17 +1125,8 @@ VIRTUAL BOARDS
   color: #15803d;
 }
 
-.vb-board-status-label.is-scheduled {
-  color: #4b5563;
-}
-
 .vb-board-status-label.is-warning {
   color: #b45309;
-}
-
-.vb-board-updated {
-  color: #9ca3af;
-  font-variant-numeric: tabular-nums;
 }
 
 .virtual-board-header p {
@@ -1255,6 +1257,8 @@ VIRTUAL BOARDS
   flex: 0 0 8px;
   border-radius: 50%;
   background: #16a34a;
+  box-shadow: 0 0 0 0 rgba(22, 163, 74, .35);
+  animation: vb-pulse 1.8s infinite;
 }
 
 .vb-arrival-clock {
@@ -1759,5 +1763,14 @@ VIRTUAL BOARD FAVORITES
 @media (max-width: 700px) {
   .virtual-board-favorite-stop {
     padding: 12px 13px;
+  }
+}
+
+
+@media (prefers-reduced-motion: reduce) {
+  .live-indicator,
+  .vb-arrival-live,
+  .virtual-board-refresh.is-loading > span {
+    animation: none;
   }
 }

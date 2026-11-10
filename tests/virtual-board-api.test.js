@@ -364,6 +364,7 @@ const res = {
   await handler(req, res);
   assert.equal(res.statusCode, 200);
   assert.equal(payload.realtime_status, 'not_applicable');
+  assert.equal(payload.realtime_message, '', 'metro must not return an explanatory schedule-only status label');
   assert.equal(metroFetchCount, 0, 'metro boards must use GTFS without requesting the realtime feed');
 
   console.log('virtual-board-api: all tests passed');
