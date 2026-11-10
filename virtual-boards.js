@@ -570,9 +570,6 @@
     if (realtimeStatus === 'unavailable') {
       label = data?.realtime_message || 'Realtime временно недостъпен — показваме разписанието.';
       statusClass = 'is-warning';
-    } else if (realtimeStatus === 'not_applicable') {
-      label = data?.realtime_message || 'По разписание';
-      statusClass = 'is-scheduled';
     }
 
     if (warning) {
