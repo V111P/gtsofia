@@ -25,6 +25,7 @@ vm.runInNewContext(source, context, { filename: sourcePath });
 const {
   formatArrivalCountdown,
   rememberRealtimeArrivalPredictions,
+  reconcileRealtimeCoursePresence,
   suppressPassedRealtimeFallbacks,
   sameArrivalTrip,
   sortBoardRoutesByNextArrival,
@@ -92,24 +93,27 @@ assert.equal(getBoardAutoRefreshDelay(), 60_000, 'a GTFS fallback response cause
 recordBoardRefreshOutcome({ realtime_status: 'not_applicable' });
 assert.equal(getBoardAutoRefreshDelay(), 60_000, 'metro should use a 60-second schedule-only refresh interval');
 
-// If a realtime prediction was shown before the vehicle arrived, remember
-// that exact trip. The next feed may already have removed it; its later GTFS
-// timetable time must not resurrect the same course ahead of the next trip.
+// A v1 history entry may contain the producer Trip ID while a refreshed
+// response contains the canonical GTFS Trip ID. Match the two only when the
+// exact planned passage timestamp at this stop also agrees.
 const stopId = '0470';
 const previousRealtimeSnapshot = {
   routes: [{
     route_id: 'TM22',
-    trip_id: 'TM22-TRIP-42',
+    // Simulate a v1 browser history record created before the API began
+    // normalizing producer Trip IDs to the canonical GTFS original_trip_id.
+    trip_id: 'PRODUCER-TRIP-42',
     trip_start_date: '20261110',
     trip_start_time: '14:00:00',
     direction_id: '2',
     realtime: true,
     times: [{
       timestamp: 14 * 3600 + 39 * 60,
+      scheduled_time: 14 * 3600 + 42 * 60,
       scheduled: false,
       source: 'realtime',
       route_id: 'TM22',
-      trip_id: 'TM22-TRIP-42',
+      trip_id: 'PRODUCER-TRIP-42',
       trip_start_date: '20261110',
       trip_start_time: '14:00:00',
       direction_id: '2'
@@ -122,22 +126,26 @@ const afterArrival = 14 * 3600 + 40 * 60;
 rememberRealtimeArrivalPredictions(previousRealtimeSnapshot, stopId, beforeArrival);
 
 // A later feed refresh may revise the ETA from 14:39 to 14:41 just before
-// the earlier estimate elapses. Keep the earliest observed estimate so the
-// old GTFS 14:42 time cannot resurrect the same early-running vehicle.
+// the earlier estimate elapses, while also switching to the canonical GTFS ID
+// and a different direction_id encoding. Keep the earliest observed estimate
+// so the old GTFS 14:42 time cannot resurrect the same early-running vehicle.
 const revisedRealtimeSnapshot = {
   routes: [{
     route_id: 'TM22',
     trip_id: 'TM22-TRIP-42',
+    realtime_trip_id: 'PRODUCER-TRIP-42',
     trip_start_date: '20261110',
     trip_start_time: '14:00:00',
     direction_id: '0',
     realtime: true,
     times: [{
       timestamp: 14 * 3600 + 41 * 60,
+      scheduled_time: 14 * 3600 + 42 * 60,
       scheduled: false,
       source: 'realtime',
       route_id: 'TM22',
       trip_id: 'TM22-TRIP-42',
+      realtime_trip_id: 'PRODUCER-TRIP-42',
       trip_start_date: '20261110',
       trip_start_time: '14:00:00',
       direction_id: '0'
@@ -153,6 +161,24 @@ assert.equal(
   ),
   true,
   'matching GTFS Trip ID and start time must survive inconsistent direction_id values'
+);
+
+assert.equal(
+  sameArrivalTrip(
+    { stop_id: stopId, route_id: 'TM22', trip_id: 'TM22-TRIP-42', realtime_trip_id: 'PRODUCER-TRIP-42', trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: '2' },
+    { stop_id: stopId, route_id: 'TM22', trip_id: 'PRODUCER-TRIP-42', trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: '2' }
+  ),
+  true,
+  'a previous canonical history record must recognize the producer ID alias when the descriptor remains in the feed'
+);
+
+assert.equal(
+  sameArrivalTrip(
+    { stop_id: stopId, route_id: 'TM22', trip_id: 'OLD-PRODUCER-ID', trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: '0', scheduled_time: 14 * 3600 + 42 * 60 },
+    { stop_id: stopId, route_id: 'TM22', trip_id: 'NEW-GTFS-ID', trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: '1', scheduled_time: 14 * 3600 + 42 * 60 }
+  ),
+  false,
+  'a scheduled-time alias must not merge conflicting Trip IDs from opposite directions'
 );
 
 const refreshedTimetableSnapshot = {
@@ -217,6 +243,263 @@ assert.deepEqual(
   'a remembered realtime prediction must not suppress its GTFS fallback before its predicted arrival'
 );
 
+// An early-running vehicle can disappear from a fresh feed before its last
+// predicted ETA. Waiting until that ETA elapses is too late: its later GTFS
+// time would briefly reappear. A stop-independent descriptor list distinguishes
+// a vanished course from a trip that remains in the feed but has no update for
+// this particular stop.
+const earlyRunStopId = 'EARLY-RUN-STOP';
+const earlyRunAt = 14 * 3600 + 38 * 60;
+const earlyRunNextPoll = earlyRunAt + 30;
+const earlyRunCourse = {
+  route_id: 'TB42',
+  trip_id: 'GTFS-TRIP-42',
+  realtime_trip_id: 'PRODUCER-TRIP-42',
+  trip_start_date: '20261110',
+  trip_start_time: '14:00:00',
+  direction_id: 'D1'
+};
+const earlyRunRealtimeBoard = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: earlyRunAt,
+  routes: [{
+    route_id: 'TB42',
+    trip_id: 'GTFS-TRIP-42',
+    realtime_trip_id: 'PRODUCER-TRIP-42',
+    trip_start_date: '20261110',
+    trip_start_time: '14:00:00',
+    direction_id: 'D1',
+    realtime: true,
+    times: [{
+      timestamp: 14 * 3600 + 39 * 60,
+      scheduled_time: 14 * 3600 + 42 * 60,
+      scheduled: false,
+      source: 'realtime',
+      route_id: 'TB42',
+      trip_id: 'GTFS-TRIP-42',
+      realtime_trip_id: 'PRODUCER-TRIP-42',
+      trip_start_date: '20261110',
+      trip_start_time: '14:00:00',
+      direction_id: 'D1'
+    }]
+  }]
+};
+rememberRealtimeArrivalPredictions(earlyRunRealtimeBoard, earlyRunStopId, earlyRunAt);
+assert.equal(reconcileRealtimeCoursePresence({
+  ...earlyRunRealtimeBoard,
+  realtime_courses: [earlyRunCourse]
+}, earlyRunStopId, earlyRunAt), false,
+'a course still present in the fresh feed must not be marked as disappeared');
+
+const earlyRunFallbackBoard = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: earlyRunNextPoll,
+  realtime_courses: [{
+    ...earlyRunCourse,
+    stop_update_state: 'downstream-only'
+  }],
+  routes: [{
+    route_id: 'TB42',
+    times: [
+      {
+        timestamp: 14 * 3600 + 42 * 60,
+        scheduled: true,
+        source: 'static',
+        route_id: 'TB42',
+        trip_id: 'GTFS-TRIP-42',
+        trip_start_date: '20261110',
+        trip_start_time: '14:00:00',
+        direction_id: 'D1'
+      },
+      {
+        timestamp: 14 * 3600 + 50 * 60,
+        scheduled: true,
+        source: 'static',
+        route_id: 'TB42',
+        trip_id: 'GTFS-TRIP-50',
+        trip_start_date: '20261110',
+        trip_start_time: '14:10:00',
+        direction_id: 'D1'
+      }
+    ]
+  }]
+};
+assert.equal(reconcileRealtimeCoursePresence(earlyRunFallbackBoard, earlyRunStopId, earlyRunNextPoll), true,
+'a course whose fresh TripUpdate has advanced to downstream stops must be retired before its predicted ETA if necessary');
+const earlyRunSuppressed = suppressPassedRealtimeFallbacks(
+  earlyRunFallbackBoard,
+  earlyRunStopId,
+  earlyRunNextPoll
+);
+assert.deepEqual(
+  earlyRunSuppressed.routes.flatMap(route => route.times).map(time => time.trip_start_time),
+  ['14:10:00'],
+  'a vanished early-running course must not reappear at its later GTFS time; the next distinct run must remain'
+);
+
+const disappearedStopId = 'DISAPPEARED-COURSE-STOP';
+rememberRealtimeArrivalPredictions(earlyRunRealtimeBoard, disappearedStopId, earlyRunAt);
+const disappearedCourseSnapshot = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: earlyRunNextPoll,
+  realtime_courses: [],
+  routes: [{
+    route_id: 'TB42',
+    times: [{
+      timestamp: 14 * 3600 + 42 * 60,
+      scheduled: true,
+      trip_id: 'GTFS-TRIP-42',
+      realtime_trip_id: 'PRODUCER-TRIP-42',
+      trip_start_date: '20261110',
+      trip_start_time: '14:00:00',
+      direction_id: 'D1'
+    }]
+  }]
+};
+assert.equal(reconcileRealtimeCoursePresence(disappearedCourseSnapshot, disappearedStopId, earlyRunNextPoll), true,
+'a course removed completely from a fresh valid feed must also be retired');
+assert.equal(suppressPassedRealtimeFallbacks(disappearedCourseSnapshot, disappearedStopId, earlyRunNextPoll)
+  .routes.flatMap(route => route.times).length, 0,
+'a completely disappeared realtime course must not be resurrected by its later timetable time');
+
+// A descriptor still present in the feed is not considered gone merely
+// because it has no prediction for this stop (e.g. its updates cover a later
+// route segment only). In that case the per-stop GTFS fallback remains valid.
+const partialCoverageStopId = 'PARTIAL-COVERAGE-STOP';
+const partialCoverageAt = 14 * 3600 + 38 * 60;
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    route_id: 'TB42', trip_id: 'GTFS-PARTIAL', realtime_trip_id: 'PRODUCER-PARTIAL',
+    trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1', realtime: true,
+    times: [{
+      timestamp: 14 * 3600 + 39 * 60, scheduled_time: 14 * 3600 + 42 * 60,
+      scheduled: false, source: 'realtime', trip_id: 'GTFS-PARTIAL',
+      realtime_trip_id: 'PRODUCER-PARTIAL', trip_start_date: '20261110',
+      trip_start_time: '14:00:00', direction_id: 'D1'
+    }]
+  }]
+}, partialCoverageStopId, partialCoverageAt);
+const partialCoverageSnapshot = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: partialCoverageAt + 20,
+  realtime_courses: [{
+    route_id: 'TB42', trip_id: 'GTFS-PARTIAL', realtime_trip_id: 'PRODUCER-PARTIAL',
+    trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1'
+  }],
+  routes: [{
+    route_id: 'TB42',
+    times: [{
+      timestamp: 14 * 3600 + 42 * 60, scheduled: true, trip_id: 'GTFS-PARTIAL',
+      trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1'
+    }]
+  }]
+};
+assert.equal(reconcileRealtimeCoursePresence(partialCoverageSnapshot, partialCoverageStopId, partialCoverageAt + 20), false,
+'a realtime descriptor still present in the current feed must not be retired due to a local stop coverage gap');
+assert.equal(suppressPassedRealtimeFallbacks(partialCoverageSnapshot, partialCoverageStopId, partialCoverageAt + 20)
+  .routes.flatMap(route => route.times).length, 1,
+'GTFS fallback must remain visible when the descriptor still exists but has no usable stop prediction');
+
+const noDataStopId = 'NO-DATA-STOP';
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    route_id: 'TB42', trip_id: 'GTFS-NO-DATA', trip_start_date: '20261110',
+    trip_start_time: '14:00:00', direction_id: 'D1', realtime: true,
+    times: [{ timestamp: 14 * 3600 + 39 * 60, scheduled_time: 14 * 3600 + 42 * 60,
+      scheduled: false, source: 'realtime', trip_id: 'GTFS-NO-DATA',
+      trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1' }]
+  }]
+}, noDataStopId, partialCoverageAt);
+const noDataSnapshot = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: partialCoverageAt + 20,
+  realtime_courses: [{
+    route_id: 'TB42', trip_id: 'GTFS-NO-DATA', trip_start_date: '20261110',
+    trip_start_time: '14:00:00', direction_id: 'D1', stop_update_state: 'no-data'
+  }],
+  routes: [{
+    route_id: 'TB42',
+    times: [{ timestamp: 14 * 3600 + 42 * 60, scheduled: true,
+      trip_id: 'GTFS-NO-DATA', trip_start_date: '20261110',
+      trip_start_time: '14:00:00', direction_id: 'D1' }]
+  }]
+};
+assert.equal(reconcileRealtimeCoursePresence(noDataSnapshot, noDataStopId, partialCoverageAt + 20), false,
+'explicit NO_DATA at the selected stop is a local coverage gap, not proof that the vehicle passed');
+assert.equal(suppressPassedRealtimeFallbacks(noDataSnapshot, noDataStopId, partialCoverageAt + 20)
+  .routes.flatMap(route => route.times).length, 1,
+'GTFS fallback must remain available for an explicit NO_DATA update at the selected stop');
+
+// A failed upstream request is not evidence that a vehicle disappeared from
+// the feed. Retain the ordinary GTFS fallback in that case.
+const outageStopId = 'REALTIME-OUTAGE-STOP';
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    route_id: 'TB42', trip_id: 'GTFS-OUTAGE', trip_start_date: '20261110',
+    trip_start_time: '14:00:00', direction_id: 'D1', realtime: true,
+    times: [{ timestamp: 14 * 3600 + 39 * 60, scheduled: false, source: 'realtime',
+      trip_id: 'GTFS-OUTAGE', trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1' }]
+  }]
+}, outageStopId, partialCoverageAt);
+const outageFallbackSnapshot = {
+  realtime_status: 'unavailable',
+  realtime_courses: [],
+  routes: [{
+    route_id: 'TB42',
+    times: [{ timestamp: 14 * 3600 + 42 * 60, scheduled: true, trip_id: 'GTFS-OUTAGE',
+      trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1' }]
+  }]
+};
+assert.equal(reconcileRealtimeCoursePresence(outageFallbackSnapshot, outageStopId, partialCoverageAt + 20), false,
+'a realtime outage must not mark previously observed trips as missing');
+assert.equal(suppressPassedRealtimeFallbacks(outageFallbackSnapshot, outageStopId, partialCoverageAt + 20)
+  .routes.flatMap(route => route.times).length, 1,
+'GTFS fallback must remain available when the realtime API itself is unavailable');
+
+const staleFeedSnapshot = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: partialCoverageAt - 180,
+  realtime_courses: [],
+  routes: []
+};
+assert.equal(reconcileRealtimeCoursePresence(staleFeedSnapshot, outageStopId, partialCoverageAt + 20), false,
+'a stale feed timestamp must not be treated as proof that a previously observed course disappeared');
+
+// v1 localStorage records did not persist scheduled_time. The fallback must
+// still match them when the service date, exact start time and direction agree.
+const legacyHistoryKey = 'gtsofia.virtualBoard.realtimeArrivalHistory.v1';
+localStorageData.set(legacyHistoryKey, JSON.stringify([{
+  identity: {
+    stop_id: 'LEGACY-STOP',
+    route_id: 'TB42',
+    trip_id: 'OLD-PRODUCER-ID',
+    trip_start_date: '20261110',
+    trip_start_time: '14:00:00',
+    direction_id: '2'
+  },
+  timestamp: 14 * 3600 + 39 * 60,
+  earliest_timestamp: 14 * 3600 + 39 * 60,
+  passed_at: 14 * 3600 + 39 * 60,
+  remembered_at: 14 * 3600 + 38 * 60
+}]));
+const legacyIdentitySuppression = suppressPassedRealtimeFallbacks({
+  status: 'ok',
+  routes: [{
+    route_id: 'TB42',
+    times: [{
+      timestamp: 14 * 3600 + 42 * 60,
+      scheduled: true,
+      route_id: 'TB42',
+      trip_id: 'CANONICAL-GTFS-ID',
+      trip_start_date: '20261110',
+      trip_start_time: '14:00:00',
+      direction_id: '2'
+    }]
+  }]
+}, 'LEGACY-STOP', 14 * 3600 + 40 * 60);
+assert.equal(legacyIdentitySuppression.routes.length, 0,
+  'legacy producer IDs must still suppress the same GTFS course when the exact service/start/direction signature matches');
+
 // Client-side suppression can remove the first scheduled arrival in a line
 // group after the API has already sorted the groups. The groups must then be
 // sorted again by their new earliest remaining arrival.
@@ -274,5 +557,119 @@ assert.deepEqual(
   ['TB7', 'TB1'],
   'all line groups must be globally ordered by their next arrival timestamp, independent of input order'
 );
+
+// End-to-end regression: first refresh shows an early realtime arrival;
+// the next fresh feed still contains the course but only reports a downstream
+// stop. The course must not return from GTFS with its later scheduled time.
+const { createDataContext } = require('../api/virtual-board-service');
+const integrationDate = '2026-10-30';
+const integrationStart = new Date('2026-10-30T14:38:00+02:00');
+const integrationStopId = 'BOARD-EARLY-INTEGRATION';
+const integrationService = createDataContext({
+  routes: [{ route_id: 'TB42', route_short_name: '42', route_type: '3' }],
+  directions: {
+    TB42: {
+      D1: {
+        key: 'D1', direction_id: 'D1', headsign: 'Крайна спирка', destination: 'Крайна спирка',
+        pattern: ['START-EARLY', integrationStopId, 'END-EARLY'],
+        stops: [
+          { stop_id: 'START-EARLY', osm_name: 'Начало' },
+          { stop_id: integrationStopId, osm_name: 'Тестова спирка' },
+          { stop_id: 'END-EARLY', osm_name: 'Крайна спирка' }
+        ]
+      }
+    }
+  },
+  schedules: {
+    TB42: {
+      D1: {
+        weekday: [
+          { trip_id: 42, original_trip_id: 'GTFS-EARLY-42', service_id: 'SERVICE', start_time: '14:00:00', stop_sequences: [1, 2, 3], times: ['14:00:00', '14:42:00', '15:03:00'] },
+          { trip_id: 43, original_trip_id: 'GTFS-NEXT-43', service_id: 'SERVICE', start_time: '14:10:00', stop_sequences: [1, 2, 3], times: ['14:10:00', '14:50:00', '15:11:00'] }
+        ],
+        weekend: []
+      }
+    }
+  },
+  stops: [
+    { stop_id: integrationStopId, stop_code: 'EARLY42', stop_name: 'Тестова спирка', osm_stop_name: 'Тестова спирка' },
+    { stop_id: 'START-EARLY', stop_code: 'START-EARLY', stop_name: 'Начало' },
+    { stop_id: 'END-EARLY', stop_code: 'END-EARLY', stop_name: 'Крайна спирка' }
+  ],
+  calendar: {
+    dateTypes: { [integrationDate]: 'weekday' },
+    serviceIdsByDate: { [integrationDate]: ['SERVICE'] }
+  }
+});
+
+const firstIntegrationFeed = integrationService.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'PRODUCER-EARLY-42', route_id: 'TB42', trip_start_date: '20261030',
+    trip_start_time: '14:00:00', direction_id: 'D1',
+    schedule_relationship: 0, schedule_relationship_name: 'SCHEDULED',
+    stop_time_updates: [{
+      stop_id: integrationStopId, stop_sequence: 2, schedule_relationship: 0,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T14:39:00+02:00') / 1000,
+        scheduled_time: Date.parse('2026-10-30T14:42:00+02:00') / 1000,
+        delay: -180
+      }
+    }]
+  }]
+}, 'EARLY42', integrationStart);
+assert.ok(firstIntegrationFeed.routes.some(route => route.times.some(time => time.source === 'realtime')),
+  'the first integration refresh must show the early realtime arrival');
+assert.equal(firstIntegrationFeed.realtime_courses[0]?.stop_update_state, 'target-update',
+  'the first feed must classify this course as having a realtime update at the selected stop');
+const firstIntegrationSnapshot = {
+  ...firstIntegrationFeed,
+  realtime_status: 'available',
+  realtime_feed_timestamp: Math.floor(integrationStart.getTime() / 1000)
+};
+rememberRealtimeArrivalPredictions(firstIntegrationSnapshot, integrationStopId, integrationStart.getTime() / 1000);
+reconcileRealtimeCoursePresence(firstIntegrationSnapshot, integrationStopId, integrationStart.getTime() / 1000);
+
+const secondIntegrationNow = new Date('2026-10-30T14:38:30+02:00');
+const secondIntegrationFeed = integrationService.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'PRODUCER-EARLY-42', route_id: 'TB42', trip_start_date: '20261030',
+    trip_start_time: '14:00:00', direction_id: 'D1',
+    schedule_relationship: 0, schedule_relationship_name: 'SCHEDULED',
+    stop_time_updates: [{
+      stop_id: 'END-EARLY', stop_sequence: 3, schedule_relationship: 0,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T15:04:00+02:00') / 1000,
+        scheduled_time: Date.parse('2026-10-30T15:03:00+02:00') / 1000,
+        delay: 60
+      }
+    }]
+  }]
+}, 'EARLY42', secondIntegrationNow);
+assert.equal(secondIntegrationFeed.realtime_courses[0]?.stop_update_state, 'downstream-only',
+  'the second feed must show that the same course now has timed updates only downstream of the selected stop');
+assert.ok(secondIntegrationFeed.routes.some(route => route.times.some(time => time.scheduled
+  && time.trip_start_time === '14:00:00')),
+  'the service layer should still generate the GTFS fallback before browser history reconciles the early course');
+const secondIntegrationSnapshot = {
+  ...secondIntegrationFeed,
+  realtime_status: 'available',
+  realtime_feed_timestamp: Math.floor(secondIntegrationNow.getTime() / 1000)
+};
+rememberRealtimeArrivalPredictions(secondIntegrationSnapshot, integrationStopId, secondIntegrationNow.getTime() / 1000);
+reconcileRealtimeCoursePresence(secondIntegrationSnapshot, integrationStopId, secondIntegrationNow.getTime() / 1000);
+const integratedEarlyArrivalResult = suppressPassedRealtimeFallbacks(
+  secondIntegrationSnapshot,
+  integrationStopId,
+  secondIntegrationNow.getTime() / 1000
+);
+const integratedTimes = integratedEarlyArrivalResult.routes.flatMap(route => route.times);
+assert.ok(!integratedTimes.some(time => time.scheduled && time.trip_start_time === '14:00:00'),
+  'the early realtime course must not reappear as its later 14:42 GTFS fallback');
+assert.ok(integratedTimes.some(time => time.scheduled && time.trip_start_time === '14:10:00'),
+  'the next scheduled course must remain visible after suppressing the early-running course');
 
 console.log('virtual-board-arrivals: presentation tests passed');

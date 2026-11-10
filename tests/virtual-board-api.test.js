@@ -22,11 +22,13 @@ function field(number, wireType, value) {
 
 const text = value => Buffer.from(String(value), 'utf8');
 
-function encodeTripDescriptor({ tripId, startTime, startDate = '20260930', routeId }) {
+function encodeTripDescriptor({ tripId, startTime, startDate = null, routeId }) {
   return Buffer.concat([
     field(1, 2, text(tripId)),
     field(2, 2, text(startTime)),
-    field(3, 2, text(startDate)),
+    // TripDescriptor.start_date is the service date of this trip. Tests that
+    // use today's active GTFS schedule must use today's Sofia service date.
+    field(3, 2, text(startDate || sofiaDate)),
     field(5, 2, text(routeId))
   ]);
 }
@@ -101,6 +103,13 @@ const deletedFallbackCourse = staticAtStop0605.routes.find(route =>
 );
 assert.ok(deletedFallbackCourse, 'GTFS must contain an upcoming TB2 fallback course at 0605');
 const deletedFallbackTime = deletedFallbackCourse.times.find(time => time.scheduled).timestamp;
+const normalFallbackCourse = staticAtStop0605.routes
+  .filter(route => route.route_id === 'TB2')
+  .flatMap(route => (route.times || [])
+    .filter(time => time.scheduled)
+    .map(time => ({ ...route, ...time })))
+  .find(time => time.trip_id && time.trip_id !== deletedFallbackCourse.original_trip_id);
+assert.ok(normalFallbackCourse, 'GTFS must contain a second active TB2 course for the realtime ID-normalization test');
 
 const staticAtStop2082 = buildVirtualBoard({ routes: [], skipped_trips: [] }, '2082', nowDate);
 const realtimeOnlyCourse = staticAtStop2082.routes.find(route =>
@@ -148,7 +157,7 @@ const noDataTrip = encodeTripUpdate({
 const normalTrip = encodeTripUpdate({
   trip: {
     tripId: 'REALTIME-NORMAL',
-    startTime: '08:40:00',
+    startTime: normalFallbackCourse.trip_start_time,
     routeId: 'TB2'
   },
   stopUpdates: [{
@@ -265,11 +274,26 @@ const res = {
   assert.equal(Object.hasOwn(payload, 'skipped_trips'), false);
 
   const realtimeArrival = payload.routes.find(route =>
-    route.trip_id === 'REALTIME-NORMAL'
+    route.realtime_trip_id === 'REALTIME-NORMAL'
       && route.times?.some(time => Number(time.timestamp) === now + 60)
   );
   assert.ok(realtimeArrival, 'a stop-specific realtime prediction must be included in the final board response');
   assert.equal(realtimeArrival.realtime, true);
+  assert.notEqual(
+    realtimeArrival.trip_id,
+    'REALTIME-NORMAL',
+    'when exact route + start_time matching resolves a GTFS course, the board must expose its canonical GTFS Trip ID'
+  );
+  assert.ok(
+    realtimeArrival.times.some(time => time.trip_id === realtimeArrival.trip_id
+      && time.realtime_trip_id === 'REALTIME-NORMAL'),
+    'the arrival event must use the same canonical course identity as its route row while retaining the producer ID for diagnostics'
+  );
+  assert.ok(
+    !payload.routes.flatMap(route => route.times || []).some(time => time.scheduled
+      && time.trip_id === realtimeArrival.trip_id),
+    'the canonical GTFS course must not also be returned as a scheduled fallback beside its realtime prediction'
+  );
   assert.ok(realtimeArrival.meta, 'the API should return line display metadata');
   assert.ok(realtimeArrival.destination, 'the API should resolve a destination before returning the board');
   assert.ok(

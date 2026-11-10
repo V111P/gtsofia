@@ -19,6 +19,8 @@
   const BOARD_AUTO_REFRESH_MAX_INTERVAL_MS = 120_000;
   const REALTIME_ARRIVAL_HISTORY_KEY = 'gtsofia.virtualBoard.realtimeArrivalHistory.v1';
   const REALTIME_ARRIVAL_HISTORY_TTL_SECONDS = 36 * 60 * 60;
+  const REALTIME_FEED_MAX_AGE_SECONDS = 120;
+  const REALTIME_FEED_MAX_FUTURE_SKEW_SECONDS = 60;
   let realtimeArrivalHistoryMemory = [];
   const boardPanel = () =>
     document.getElementById("virtualBoardBody");
@@ -107,13 +109,32 @@
         || route?.original_trip_id
         || ''
       ).trim(),
+      realtime_trip_id: String(
+        time?.realtime_trip_id || route?.realtime_trip_id || ''
+      ).trim(),
+      stop_update_state: String(time?.stop_update_state || route?.stop_update_state || '').trim(),
       trip_start_date: normalizeTripDate(
         time?.trip_start_date || route?.trip_start_date || ''
       ),
       trip_start_time: String(
         time?.trip_start_time || route?.trip_start_time || ''
       ).trim(),
-      direction_id: String(time?.direction_id || route?.direction_id || '').trim()
+      direction_id: String(time?.direction_id || route?.direction_id || '').trim(),
+      // Scheduled event time is a stronger cross-version alias than a
+      // producer-specific Trip ID. It lets older history entries match the
+      // canonical GTFS Trip ID after backend identity normalization.
+      scheduled_time: (() => {
+        const hasValue = value => value !== null && value !== undefined && value !== '';
+        const explicit = hasValue(time?.scheduled_time) ? Number(time.scheduled_time) : NaN;
+        if (Number.isFinite(explicit)) return explicit;
+        if (time?.scheduled === true) {
+          const planned = hasValue(time?.timestamp) ? Number(time.timestamp) : NaN;
+          return Number.isFinite(planned) ? planned : null;
+        }
+        const actual = hasValue(time?.timestamp) ? Number(time.timestamp) : NaN;
+        const delay = hasValue(time?.delay) ? Number(time.delay) : NaN;
+        return Number.isFinite(actual) && Number.isFinite(delay) ? actual - delay : null;
+      })()
     };
 
     if (!identity.stop_id || !identity.route_id) return null;
@@ -125,11 +146,37 @@
     if (!left || !right) return false;
     if (left.stop_id !== right.stop_id || left.route_id !== right.route_id) return false;
 
-    const hasSharedTripId = Boolean(left.trip_id && right.trip_id);
-    if (hasSharedTripId) {
-      if (left.trip_id !== right.trip_id) return false;
-    } else if (!left.trip_start_time || !right.trip_start_time
-      || left.trip_start_time !== right.trip_start_time) {
+    const leftTripIds = new Set([left.trip_id, left.realtime_trip_id].filter(Boolean));
+    const rightTripIds = new Set([right.trip_id, right.realtime_trip_id].filter(Boolean));
+    const sharedTripIds = [...leftTripIds].filter(id => rightTripIds.has(id));
+    const hasSharedTripId = leftTripIds.size > 0 && rightTripIds.size > 0;
+    const sameTripId = sharedTripIds.length > 0;
+    const leftScheduledTime = left.scheduled_time === null || left.scheduled_time === undefined
+      || left.scheduled_time === '' ? NaN : Number(left.scheduled_time);
+    const rightScheduledTime = right.scheduled_time === null || right.scheduled_time === undefined
+      || right.scheduled_time === '' ? NaN : Number(right.scheduled_time);
+    const hasSameScheduledStopTime = Number.isFinite(leftScheduledTime)
+      && Number.isFinite(rightScheduledTime)
+      && Math.abs(leftScheduledTime - rightScheduledTime) <= 1;
+    const hasConflictingScheduledTimes = Number.isFinite(leftScheduledTime)
+      && Number.isFinite(rightScheduledTime)
+      && !hasSameScheduledStopTime;
+    const hasSameStartTime = Boolean(left.trip_start_time && right.trip_start_time
+      && left.trip_start_time === right.trip_start_time);
+    const hasSameDirection = Boolean(left.direction_id && right.direction_id
+      && left.direction_id === right.direction_id);
+    const legacyIdAlias = hasSameStartTime && hasSameDirection && !hasConflictingScheduledTimes;
+
+    if (hasSharedTripId && !sameTripId && !hasSameScheduledStopTime && !legacyIdAlias) {
+      // Older browser history may contain the producer's Trip ID while a
+      // newer API response carries the canonical GTFS original_trip_id. New
+      // records can match through the exact planned passage time at this stop.
+      // Legacy records without that field may match only with the stricter
+      // route + service date + exact start_time + exact direction signature.
+      return false;
+    }
+    if (!hasSharedTripId && (!left.trip_start_time || !right.trip_start_time
+      || left.trip_start_time !== right.trip_start_time)) {
       return false;
     }
 
@@ -138,11 +185,12 @@
     if (left.trip_start_time && right.trip_start_time
       && left.trip_start_time !== right.trip_start_time) return false;
 
-    // When the real GTFS Trip ID and start time match, they are a stronger
-    // identity than direction_id. Some feeds encode direction_id differently
-    // (or omit it) between a TripUpdate and the corresponding timetable row.
-    // Keep direction as a discriminator only for the time-only fallback.
-    if (!hasSharedTripId && left.direction_id && right.direction_id
+    // Matching Trip IDs are strongest. If the IDs conflict and we are using
+    // a scheduled-time alias to bridge producer/GTFS identities, direction is
+    // still a required discriminator whenever both versions provide it.
+    // Otherwise two opposite-direction trips at the same stop/time could be
+    // mistaken for the same vehicle and the wrong GTFS fallback suppressed.
+    if (!sameTripId && left.direction_id && right.direction_id
       && left.direction_id !== right.direction_id) return false;
 
     return true;
@@ -274,11 +322,14 @@
             // Preserve a known identity field if this refresh omits it.
             trip_start_date: identity.trip_start_date || previous?.identity?.trip_start_date || '',
             trip_start_time: identity.trip_start_time || previous?.identity?.trip_start_time || '',
-            direction_id: identity.direction_id || previous?.identity?.direction_id || ''
+            direction_id: identity.direction_id || previous?.identity?.direction_id || '',
+            realtime_trip_id: identity.realtime_trip_id || previous?.identity?.realtime_trip_id || ''
           },
           timestamp,
           earliest_timestamp: earliestTimestamp,
           passed_at: passedAt,
+          missing_from_realtime_at: null,
+          last_seen_realtime_at: nowSeconds,
           remembered_at: nowSeconds
         };
         if (matchingIndex >= 0) next[matchingIndex] = record;
@@ -289,6 +340,75 @@
     writeRealtimeArrivalHistory(next.filter(item =>
       Number(item?.remembered_at) >= nowSeconds - REALTIME_ARRIVAL_HISTORY_TTL_SECONDS
     ));
+  }
+
+  function reconcileRealtimeCoursePresence(boardData, stopId, nowSeconds = Date.now() / 1000) {
+    // Only a fresh, successfully fetched feed can prove that a previously
+    // observed course has disappeared. An API outage, stale feed, metro board
+    // or old server response must not retire realtime history.
+    if (boardData?.realtime_status !== 'available') return false;
+    if (!Array.isArray(boardData?.realtime_courses)) return false;
+
+    const feedTimestamp = Number(boardData?.realtime_feed_timestamp);
+    if (!Number.isFinite(feedTimestamp) || feedTimestamp <= 0) return false;
+    const feedAge = nowSeconds - feedTimestamp;
+    if (feedAge > REALTIME_FEED_MAX_AGE_SECONDS
+      || feedAge < -REALTIME_FEED_MAX_FUTURE_SKEW_SECONDS) return false;
+
+    const selectedStopId = String(stopId ?? '').trim();
+    if (!selectedStopId) return false;
+
+    const currentCourses = boardData.realtime_courses
+      .map(course => getArrivalTripIdentity(course, {}, selectedStopId))
+      .filter(Boolean);
+    const history = readRealtimeArrivalHistory(nowSeconds);
+    let changed = false;
+
+    const reconciled = history.map(item => {
+      const identity = item?.identity;
+      if (!identity || String(identity.stop_id || '').trim() !== selectedStopId) return item;
+
+      const matchingCourses = currentCourses.filter(course => sameArrivalTrip(identity, course));
+      if (matchingCourses.length) {
+        // If multiple descriptors describe the same physical course, any
+        // target/upstream/unknown state takes precedence over a downstream-only
+        // descriptor. This prevents duplicate raw-route + TripUpdate records
+        // from falsely marking a course as already past the selected stop.
+        const passedSelectedStop = matchingCourses.every(
+          course => course.stop_update_state === 'downstream-only'
+        );
+        if (!passedSelectedStop) {
+          if (item.missing_from_realtime_at !== null && item.missing_from_realtime_at !== undefined) {
+            changed = true;
+            return { ...item, missing_from_realtime_at: null, last_seen_realtime_at: nowSeconds };
+          }
+          return item;
+        }
+
+        // If this exact course was previously shown realtime at the selected
+        // stop, and the fresh TripUpdate now carries timed updates only for
+        // downstream stops, the feed has advanced beyond this stop. This is
+        // stronger evidence of passage than waiting for the old ETA, which may
+        // have been several minutes late compared with the actual vehicle.
+      }
+
+      if (item.missing_from_realtime_at !== null && item.missing_from_realtime_at !== undefined
+        && Number.isFinite(Number(item.missing_from_realtime_at))) {
+        return item;
+      }
+
+      // A fresh feed no longer carries the descriptor for a course that was
+      // previously displayed realtime at this exact stop. The vehicle may
+      // have passed earlier than its last ETA, so waiting for that ETA would
+      // resurrect the later GTFS timetable time. A descriptor with NO_DATA,
+      // unknown coverage, or an upstream/target update is retained as present;
+      // only a vanished descriptor or downstream-only progression retires it.
+      changed = true;
+      return { ...item, missing_from_realtime_at: nowSeconds };
+    });
+
+    if (changed) writeRealtimeArrivalHistory(reconciled);
+    return changed;
   }
 
   function suppressPassedRealtimeFallbacks(boardData, stopId, nowSeconds = Date.now() / 1000) {
@@ -307,7 +427,11 @@
             const hasPassedAt = item?.passed_at !== null
               && item?.passed_at !== undefined
               && Number.isFinite(Number(item.passed_at));
+            const disappearedFromFreshFeed = item?.missing_from_realtime_at !== null
+              && item?.missing_from_realtime_at !== undefined
+              && Number.isFinite(Number(item.missing_from_realtime_at));
             return hasPassedAt
+              || disappearedFromFreshFeed
               || (Number.isFinite(earliestTimestamp) && earliestTimestamp <= nowSeconds);
           });
           if (wasPredictedRealtime) removedAny = true;
@@ -618,6 +742,7 @@
     // refresh that same trip can otherwise reappear from GTFS with its
     // later scheduled time (e.g. actual 14:39 vs timetable 14:42).
     rememberRealtimeArrivalPredictions(normalized, stopCode, normalized.loaded_at);
+    reconcileRealtimeCoursePresence(normalized, stopCode, normalized.loaded_at);
     return suppressPassedRealtimeFallbacks(normalized, stopCode, normalized.loaded_at);
   }
 
@@ -1950,6 +2075,7 @@
   globalThis.__gtsofiaVirtualBoardTestInternals = {
     formatArrivalCountdown,
     rememberRealtimeArrivalPredictions,
+    reconcileRealtimeCoursePresence,
     suppressPassedRealtimeFallbacks,
     sameArrivalTrip,
     sortBoardRoutesByNextArrival,

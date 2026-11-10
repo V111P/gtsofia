@@ -13,6 +13,7 @@ function createFixture() {
       TB7: {
         D1: {
           key: 'D1',
+          direction_id: 'D1',
           headsign: 'Крайна спирка',
           destination: 'Крайна спирка',
           pattern: ['START', 'BOARD', 'END'],
@@ -187,8 +188,8 @@ const mismatchedTripIdBoard = service.buildBoard({
     destination_stop_id: 'END',
     times: [{
       timestamp: Date.parse('2026-10-30T13:41:00+02:00') / 1000,
-      scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
-      delay: 60
+      scheduled_time: Date.parse('2026-10-30T13:40:30+02:00') / 1000,
+      delay: 30
     }]
   }],
   skipped_trips: []
@@ -197,7 +198,314 @@ const mismatchedRow = mismatchedTripIdBoard.routes.find(route => route.route_id 
 assert.ok(mismatchedRow, 'the route row must remain present');
 assert.ok(
   mismatchedRow.times.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
-  'a distinct static trip must not be suppressed by a nearby realtime timestamp when its Trip ID differs'
+  'a distinct static trip must not be suppressed by a near-but-not-exact scheduled stop time when its Trip ID differs'
+);
+
+// A producer Trip ID can differ from GTFS while an exact start_time uniquely
+// identifies the scheduled course. In that case the API must normalize the
+// realtime event to the canonical GTFS original_trip_id; otherwise the browser
+// remembers one ID and the later GTFS fallback returns under another ID.
+const mismatchedIdWithExactStartBoard = service.buildBoard({
+  routes: [{
+    route_id: 'TB7',
+    trip_id: 'PRODUCER-TRIP-A',
+    trip_start_time: '13:00:00',
+    direction_id: 'D1',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    destination_stop_id: 'END',
+    times: [{
+      timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+      scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+      delay: -60
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+const normalizedProducerRow = mismatchedIdWithExactStartBoard.routes.find(route => route.route_id === 'TB7');
+assert.ok(normalizedProducerRow, 'a realtime course matched by exact start_time must remain visible');
+assert.ok(
+  normalizedProducerRow.times.some(time => !time.scheduled
+    && time.trip_id === 'GTFS-TRIP-A'
+    && time.realtime_trip_id === 'PRODUCER-TRIP-A'),
+  'the displayed realtime arrival must use the canonical GTFS Trip ID and retain the producer ID separately'
+);
+assert.equal(
+  normalizedProducerRow.times.find(time => !time.scheduled)?.scheduled_time,
+  Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+  'when GTFS mapping is known, the exact scheduled stop time must be retained even if the producer omits delay and scheduled_time'
+);
+assert.ok(
+  !normalizedProducerRow.times.some(time => time.scheduled
+    && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'the exact GTFS fallback must not be duplicated beside its realtime prediction'
+);
+
+const normalizedRealtimeCourse = mismatchedIdWithExactStartBoard.realtime_courses
+  .find(course => course.route_id === 'TB7' && course.trip_start_time === '13:00:00');
+assert.equal(normalizedRealtimeCourse?.trip_id, 'GTFS-TRIP-A',
+  'the stop-independent live course list must expose the canonical GTFS identity');
+assert.equal(normalizedRealtimeCourse?.realtime_trip_id, 'PRODUCER-TRIP-A',
+  'the live course list must retain the producer ID as an alias for browser history compatibility');
+
+const timestampOnlyRealtimeBoard = service.buildBoard({
+  routes: [{
+    route_id: 'TB7', trip_id: 'PRODUCER-TRIP-A', trip_start_time: '13:00:00', direction_id: 'D1',
+    schedule_relationship: 0, schedule_relationship_name: 'SCHEDULED',
+    destination_stop_id: 'END',
+    times: [{ timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000 }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+const timestampOnlyRealtimeTime = timestampOnlyRealtimeBoard.routes
+  .flatMap(route => route.times)
+  .find(time => time.source === 'realtime');
+assert.equal(timestampOnlyRealtimeTime?.timestamp, Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+  'an actual producer timestamp must remain the displayed ETA');
+assert.equal(timestampOnlyRealtimeTime?.scheduled_time, Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+  'the GTFS scheduled passage time must be retained separately for stable cross-ID history matching');
+
+// Some realtime producers omit TripDescriptor.start_time or encode direction_id
+// differently. An exact scheduled event at the selected stop can still map the
+// producer ID to one active GTFS course without fuzzy time matching.
+const normalizedByStopTimeBoard = service.buildBoard({
+  routes: [{
+    route_id: 'TB7',
+    trip_id: 'PRODUCER-TRIP-A',
+    trip_start_time: '',
+    direction_id: '0',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    destination_stop_id: 'END',
+    times: [{
+      timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+      scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+      delay: -60
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+const normalizedByStopTimeRow = normalizedByStopTimeBoard.routes.find(route => route.route_id === 'TB7');
+assert.ok(normalizedByStopTimeRow?.times.some(time => !time.scheduled
+  && time.trip_id === 'GTFS-TRIP-A'
+  && time.realtime_trip_id === 'PRODUCER-TRIP-A'),
+  'a producer ID without start_time must normalize from an exact scheduled event at this stop');
+assert.ok(!normalizedByStopTimeRow.times.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'exact stop-time identity mapping must suppress the duplicate GTFS fallback');
+
+const mismatchedDirectionBoard = service.buildBoard({
+  routes: [{
+    route_id: 'TB7',
+    trip_id: 'PRODUCER-TRIP-A',
+    trip_start_time: '13:00:00',
+    direction_id: '0',
+    schedule_relationship: 0,
+    destination_stop_id: 'END',
+    times: [{
+      timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+      scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+      delay: -60
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+assert.ok(mismatchedDirectionBoard.routes.find(route => route.route_id === 'TB7')?.times.some(time =>
+  !time.scheduled && time.trip_id === 'GTFS-TRIP-A'),
+  'a unique exact route + start_time match must survive a producer direction_id encoded differently from GTFS');
+
+const nearButNotExactStartBoard = service.buildBoard({
+  routes: [{
+    route_id: 'TB7',
+    trip_id: 'PRODUCER-TRIP-A',
+    trip_start_time: '13:00:30',
+    direction_id: 'D1',
+    schedule_relationship: 0,
+    destination_stop_id: 'END',
+    times: [{
+      timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+      scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+      delay: -60
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+const nearButNotExactTimes = nearButNotExactStartBoard.routes
+  .filter(route => route.route_id === 'TB7')
+  .flatMap(route => route.times);
+assert.ok(
+  nearButNotExactTimes.some(time => time.scheduled
+    && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'a producer ID mismatch must not be mapped to a nearby but non-exact GTFS start_time'
+);
+
+const duplicatedRawTripInstanceBoard = service.buildBoard({
+  routes: [{
+    route_id: 'TB7',
+    trip_id: 'GTFS-TRIP-A',
+    trip_start_time: '13:05:00',
+    direction_id: 'D1',
+    schedule_relationship: 0,
+    destination_stop_id: 'END',
+    times: [{
+      timestamp: Date.parse('2026-10-30T13:41:00+02:00') / 1000,
+      scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+      delay: 60
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+const duplicatedRawTripTimes = duplicatedRawTripInstanceBoard.routes
+  .filter(route => route.route_id === 'TB7')
+  .flatMap(route => route.times);
+assert.ok(
+  duplicatedRawTripTimes.some(time => time.scheduled
+    && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'a realtime instance reusing the same template Trip ID with a different start_time must not hide the original GTFS course'
+);
+
+const mismatchedDescriptorBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'PRODUCER-TRIP-A',
+    route_id: 'TB7',
+    trip_start_date: '20261030',
+    trip_start_time: '13:00:00',
+    direction_id: 'D1',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    stop_time_updates: [{
+      stop_id: 'BOARD',
+      stop_sequence: 2,
+      schedule_relationship: 0,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+        delay: -60
+      }
+    }]
+  }]
+}, '0200', now);
+const mismatchedDescriptorRow = mismatchedDescriptorBoard.routes.find(route => route.route_id === 'TB7');
+assert.ok(mismatchedDescriptorRow, 'a TripUpdate matched by exact start_time must produce a realtime row');
+assert.ok(
+  mismatchedDescriptorRow.times.some(time => !time.scheduled
+    && time.trip_id === 'GTFS-TRIP-A'
+    && time.realtime_trip_id === 'PRODUCER-TRIP-A'),
+  'TripUpdate-derived arrivals must also expose the canonical GTFS identity'
+);
+assert.ok(
+  !mismatchedDescriptorRow.times.some(time => time.scheduled
+    && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'a mismatched producer ID must not leave its exact scheduled trip as a duplicate fallback'
+);
+
+const descriptorMappedByStopTimeBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'PRODUCER-TRIP-A',
+    route_id: 'TB7',
+    trip_start_date: '20261030',
+    trip_start_time: '',
+    direction_id: '0',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    stop_time_updates: [{
+      stop_id: 'BOARD',
+      stop_sequence: 2,
+      schedule_relationship: 0,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+        scheduled_time: Date.parse('2026-10-30T13:40:00+02:00') / 1000,
+        delay: -60
+      }
+    }]
+  }]
+}, '0200', now);
+const descriptorMappedByStopTimeRow = descriptorMappedByStopTimeBoard.routes.find(route => route.route_id === 'TB7');
+assert.ok(descriptorMappedByStopTimeRow?.times.some(time => !time.scheduled
+  && time.trip_id === 'GTFS-TRIP-A'
+  && time.realtime_trip_id === 'PRODUCER-TRIP-A'),
+  'a descriptor without start_time must map through the exact scheduled event at the selected stop');
+assert.ok(!descriptorMappedByStopTimeRow.times.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'descriptor stop-time mapping must suppress the matching static course');
+
+// The stop-independent course list must retain a descriptor even when its
+// current StopTimeUpdates cover only a later stop. That lets the browser
+// distinguish this local realtime gap from a trip that vanished from the feed.
+const laterSegmentOnlyBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'PRODUCER-TRIP-A',
+    route_id: 'TB7',
+    trip_start_date: '20261030',
+    trip_start_time: '',
+    direction_id: '0',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    stop_time_updates: [{
+      stop_id: 'END',
+      stop_sequence: 3,
+      schedule_relationship: 0,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T14:04:00+02:00') / 1000,
+        delay: 60,
+        scheduled_time: Date.parse('2026-10-30T14:03:00+02:00') / 1000
+      }
+    }]
+  }]
+}, '0200', now);
+assert.ok(laterSegmentOnlyBoard.realtime_courses.some(course =>
+  course.trip_id === 'GTFS-TRIP-A' && course.realtime_trip_id === 'PRODUCER-TRIP-A'),
+'a TripUpdate that remains in the feed must appear in the course presence list even when it has no update for the selected stop');
+assert.ok(laterSegmentOnlyBoard.realtime_courses.some(course =>
+  course.trip_id === 'GTFS-TRIP-A' && course.stop_update_state === 'downstream-only'),
+'a TripUpdate with timed updates only after the selected stop must be marked as downstream-only');
+assert.ok(laterSegmentOnlyBoard.routes.some(route => route.times.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000))),
+'a course with realtime data only downstream must keep its GTFS fallback at the selected earlier stop');
+
+// Once that early realtime estimate has already passed, the feed may retain
+// the TripUpdate descriptor but no longer produce a displayable arrival row.
+// Its exact start_time still identifies the same GTFS course, so the old
+// timetable time must remain suppressed while the following trip stays visible.
+const mismatchedDescriptorAfterPassBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'PRODUCER-TRIP-A',
+    route_id: 'TB7',
+    trip_start_date: '20261030',
+    trip_start_time: '13:00:00',
+    direction_id: 'D1',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    stop_time_updates: [{
+      stop_id: 'BOARD',
+      stop_sequence: 2,
+      schedule_relationship: 0,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T13:39:00+02:00') / 1000,
+        delay: -60
+      }
+    }]
+  }]
+}, '0200', new Date('2026-10-30T13:41:00+02:00'));
+const mismatchedAfterPassTimes = mismatchedDescriptorAfterPassBoard.routes
+  .filter(route => route.route_id === 'TB7')
+  .flatMap(route => route.times);
+assert.ok(
+  !mismatchedAfterPassTimes.some(time => time.scheduled
+    && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'an already-passed realtime prediction must suppress the same GTFS fallback even when producer and GTFS Trip IDs differ'
+);
+assert.ok(
+  mismatchedAfterPassTimes.some(time => time.scheduled
+    && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:50:00+02:00') / 1000)),
+  'suppressing the passed trip must preserve the following distinct GTFS course'
 );
 
 // A duplicated realtime instance can reuse the same GTFS template Trip ID
