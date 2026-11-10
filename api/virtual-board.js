@@ -1354,8 +1354,6 @@ module.exports =
           : (error?.message || 'Unable to fetch/decode GTFS-RT.');
         console.warn(`GTSofia realtime fallback for stop ${stopCode}: ${detail}`);
       }
-    } else {
-      realtimeMessage = 'За метрото се използва разписанието.';
     }
 
     try {
