@@ -44,10 +44,10 @@ function getDirectionDisplayName(direction) {
   return String(
     terminalStop?.osm_name
     || terminalStop?.osm_stop_name
+    || getScheduleStopDisplayName(terminalStop)
     || direction?.osm_headsign
     || direction?.destination
     || direction?.headsign
-    || getScheduleStopDisplayName(terminalStop)
     || ""
   ).trim();
 }

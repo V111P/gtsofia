@@ -16,7 +16,13 @@
 commonly used functions so existing tests and scripts can continue importing it.
 
 
-OSM name updates are failure-safe: the generator merges fresh Overpass results
-with the last known-good `data/stops.json` snapshot. If Overpass is unavailable
-or returns only a partial result, existing OSM names are retained and GTFS
-remains only the fallback for stops that have never had an OSM name.
+Stop naming follows the same source priority as `Dimitar5555/sofiatraffic-schedules`:
+OSM is the canonical stop-name source, and a GTFS name is used only when that
+specific stop has no OSM name. Direction destinations resolve to the name of
+the direction's terminal stop before considering the GTFS trip headsign.
+
+OSM refreshes use the same Overpass endpoint and transport selectors as
+Dimitar's generator. Responses are validated before publication. If Overpass
+fails or returns an implausibly small snapshot, the last known-good OSM names
+are reused; when no complete OSM snapshot exists, generation stops rather than
+publishing a GTFS-only replacement.

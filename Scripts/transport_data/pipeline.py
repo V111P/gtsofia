@@ -5,7 +5,7 @@ from .config import DATA_DIR, GTFS_DIR, get_today, normalize
 from .gtfs import download_gtfs, read_csv
 from .osm import (
     fetch_osm_stops, enrich_stops_with_osm,
-    load_previous_osm_stops, merge_osm_stop_snapshots,
+    load_previous_osm_stops, resolve_osm_snapshot,
 )
 from .calendar import load_calendar_config, build_calendar_context
 from .stops import build_stops
@@ -101,27 +101,13 @@ def main():
 
         previous_osm_stops = load_previous_osm_stops()
         fetched_osm_stops = fetch_osm_stops()
-
-        # Keep the last known-good names when Overpass fails or returns only
-        # a partial set. A temporary OSM outage must never turn every display
-        # name back into the uppercase GTFS variant.
-        osm_stops = merge_osm_stop_snapshots(
+        osm_stops, osm_refresh_succeeded = resolve_osm_snapshot(
             fetched_osm_stops,
             previous_osm_stops,
         )
-        if fetched_osm_stops is None:
-            print(
-                "WARNING: Reusing previous OSM stop names because the OSM "
-                "request failed."
-            )
-        elif len(fetched_osm_stops) < len(previous_osm_stops):
-            print(
-                "WARNING: OSM returned fewer stop records than the previous "
-                f"snapshot ({len(fetched_osm_stops)} vs {len(previous_osm_stops)}); "
-                "previous names are retained for missing stops."
-            )
+
         print(
-            "OSM stop-name records available after merge: "
+            "OSM stop-name records available after validation: "
             f"{len(osm_stops)}"
         )
 
@@ -286,7 +272,7 @@ def main():
             "osmSource": "OpenStreetMap — Градски транспорт София",
             "osmUpdatedAt": (
                 today.isoformat()
-                if fetched_osm_stops is not None and fetched_osm_stops
+                if osm_refresh_succeeded
                 else load_previous_osm_updated_at()
             ),
             "calendar": calendar_result,

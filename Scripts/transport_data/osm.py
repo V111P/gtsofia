@@ -4,46 +4,68 @@ import urllib.request
 from urllib.parse import urlencode
 
 from .config import (
-    OSM_URL, OSM_NETWORK_NAME, OSM_STOP_TYPES, DATA_DIR,
-    normalize, normalize_osm_stop_code, normalize_stop_id,
+    OSM_URL, OSM_USER_AGENT, OSM_NETWORK_NAME, OSM_STOP_TYPES,
+    OSM_MIN_STOP_RECORDS, OSM_MIN_NAMED_STOP_RECORDS, DATA_DIR,
+    normalize, normalize_osm_stop_code,
+    normalize_gtfs_public_stop_code,
 )
 
-def fetch_osm_stops():
-    """Fetch public transport stop names from OSM; GTFS remains the fallback."""
+def build_overpass_query():
+    """Build the same OSM selector set used by Dimitar's generator."""
 
     elements = "".join(
         f'node[{transport_type}=yes][public_transport={public_transport}]'
         f'[ref][network="{OSM_NETWORK_NAME}"];'
         for transport_type, public_transport in OSM_STOP_TYPES
     )
-    query = (
-        "[out:json][timeout:50];"
+    return (
+        "[out:json][timeout:25];"
         f"({elements});"
-        "out body;"
+        "out geom;"
     )
+
+
+def fetch_osm_stops():
+    """Fetch the canonical OSM stop-name map; GTFS is only a per-stop fallback."""
+
+    query = build_overpass_query()
     request = urllib.request.Request(
         OSM_URL,
         data=urlencode({"data": query}).encode("utf-8"),
         headers={
-            "User-Agent": "GTSofia transport data generator",
+            "User-Agent": OSM_USER_AGENT,
             "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
         },
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=70) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as error:
-        # None means the request failed. The pipeline can then retain the last
-        # known-good OSM names instead of overwriting them with GTFS names.
+        # Keep the failure explicit. The pipeline may reuse a sufficiently
+        # complete previous OSM snapshot, but must never silently turn every
+        # stop into GTFS-only data.
         print(f"WARNING: Could not fetch OSM stop names: {error}")
         return None
 
-    elements = payload.get("elements", [])
+    if not isinstance(payload, dict) or not isinstance(payload.get("elements"), list):
+        print(
+            "WARNING: Overpass returned an invalid response"
+            + (f": {payload.get('remark')}" if isinstance(payload, dict) and payload.get("remark") else ".")
+        )
+        return None
 
-    # Match Dimitar's preference for platform objects over stop positions
-    # when both OSM objects share the same public stop code.
+    if payload.get("remark"):
+        print(f"WARNING: Overpass reported an incomplete response: {payload['remark']}")
+        return None
+
+    elements = payload["elements"]
+
+    # Prefer station/stop-position objects over platforms when duplicate
+    # public stop codes exist. This ordering is deterministic and independent
+    # of the response order returned by Overpass.
     priority = {
         "station": 0,
         "stop_position": 1,
@@ -68,8 +90,6 @@ def fetch_osm_stops():
         name = normalize(tags.get("name") or tags.get("name:bg"))
         name_en = normalize(tags.get("name:en"))
 
-        # Keep the record even if OSM has no name: a later GTFS fallback is
-        # still possible and the extra OSM references can be useful metadata.
         result[code] = {
             "osm_stop_name": name,
             "osm_stop_name_en": name_en,
@@ -84,9 +104,67 @@ def fetch_osm_stops():
             "osm_id": normalize(element.get("id")),
         }
 
-    print(f"OSM stops with public refs: {len(result)}")
+    named_count = sum(
+        bool(normalize(record.get("osm_stop_name")))
+        for record in result.values()
+    )
+    print(
+        f"OSM stops with public refs: {len(result)} "
+        f"({named_count} with Bulgarian names)"
+    )
     return result
 
+
+def is_usable_osm_snapshot(osm_stops):
+    """Reject empty or implausibly small Overpass responses for Sofia."""
+
+    if not isinstance(osm_stops, dict):
+        return False
+
+    named_count = sum(
+        bool(normalize((record or {}).get("osm_stop_name")))
+        for record in osm_stops.values()
+        if isinstance(record, dict)
+    )
+    return (
+        len(osm_stops) >= OSM_MIN_STOP_RECORDS
+        and named_count >= OSM_MIN_NAMED_STOP_RECORDS
+    )
+
+
+def resolve_osm_snapshot(fetched_osm_stops, previous_osm_stops):
+    """Use a complete fresh OSM map, or retain a known-good snapshot.
+
+    Returns (merged_snapshot, refreshed). If neither the current response nor
+    the previous snapshot is sufficiently complete, generation is stopped so
+    a GTFS-only replacement cannot be published accidentally.
+    """
+
+    if is_usable_osm_snapshot(fetched_osm_stops):
+        merged = merge_osm_stop_snapshots(
+            fetched_osm_stops,
+            previous_osm_stops,
+        )
+        return merged, True
+
+    if is_usable_osm_snapshot(previous_osm_stops):
+        print(
+            "WARNING: The current OSM response is empty, failed, or incomplete. "
+            "Reusing the last known-good OSM snapshot."
+        )
+        return {
+            key: dict(value)
+            for key, value in previous_osm_stops.items()
+            if isinstance(value, dict)
+        }, False
+
+    fetched_count = len(fetched_osm_stops) if isinstance(fetched_osm_stops, dict) else 0
+    previous_count = len(previous_osm_stops or {})
+    raise RuntimeError(
+        "No usable OSM stop-name snapshot is available; refusing to publish "
+        "GTFS-only stop names. "
+        f"Current OSM records: {fetched_count}; previous OSM records: {previous_count}."
+    )
 
 
 def previous_osm_stops_from_rows(stops_rows):
@@ -113,11 +191,10 @@ def previous_osm_stops_from_rows(stops_rows):
         # Older generated records may not contain all metadata fields.
         record["osm_stop_name"] = osm_name
 
-        keys = {
-            normalize_stop_id(row.get("stop_id")),
-            normalize_stop_id(row.get("stop_code")),
-        }
-        for key in keys - {""}:
+        # Store only the canonical public code. Aliasing both stop_id and
+        # stop_code can collide (for example metro M314 vs bus stop 0314).
+        key = normalize_gtfs_public_stop_code(row)
+        if key:
             previous[key] = dict(record)
 
     return previous
@@ -183,9 +260,8 @@ def enrich_stops_with_osm(stops_data, osm_stops):
         gtfs_name = normalize(row.get("stop_name"))
         row["gtfs_stop_name"] = gtfs_name
 
-        stop_id = normalize_stop_id(row.get("stop_id"))
-        stop_code = normalize_stop_id(row.get("stop_code"))
-        osm = (osm_stops or {}).get(stop_id) or (osm_stops or {}).get(stop_code) or {}
+        public_code = normalize_gtfs_public_stop_code(row)
+        osm = (osm_stops or {}).get(public_code) or {}
         osm_name = normalize(osm.get("osm_stop_name"))
 
         row.update(osm)

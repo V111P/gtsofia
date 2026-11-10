@@ -5,7 +5,13 @@ from zoneinfo import ZoneInfo
 
 GTFS_URL = "https://gtfs.sofiatraffic.bg/api/v1/static"
 OSM_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+OSM_USER_AGENT = "github/V111P/gtsofia"
 OSM_NETWORK_NAME = "Градски транспорт София"
+# Dimitar's latest merged stop snapshot contains 2,853 canonical stop codes.
+# A substantially smaller Overpass result is treated as incomplete, not as a
+# valid replacement for the last known-good OSM names.
+OSM_MIN_STOP_RECORDS = 2000
+OSM_MIN_NAMED_STOP_RECORDS = 1800
 OSM_STOP_TYPES = (
     ("subway", "station"),
     ("tram", "stop_position"),
@@ -66,6 +72,21 @@ def normalize_osm_stop_code(tags):
         return f"M{ref}"
 
     return ref.zfill(4)
+
+
+def normalize_gtfs_public_stop_code(stop):
+    """Resolve a GTFS row's public code using Dimitar's exact rule.
+
+    Metro uses stop_id (for example M314). Other transport modes use
+    stop_code; stop_id is only a fallback when stop_code is absent.
+    """
+
+    stop_id = normalize(stop.get("stop_id"))
+    if stop_id.startswith("M"):
+        return normalize_stop_id(stop_id)
+
+    stop_code = normalize(stop.get("stop_code"))
+    return normalize_stop_id(stop_code or stop_id)
 
 
 def parse_date(value):

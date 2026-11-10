@@ -769,10 +769,23 @@ def choose_direction_name(
     )
 
     if terminal_stop:
+        # stop_name is already OSM-first (GTFS is assigned only when this
+        # particular stop has no OSM name). Resolve the terminal stop exactly
+        # as Dimitar's UI does: destination = name of the last stop in the
+        # direction, not the possibly different GTFS trip_headsign.
         osm_name = normalize(terminal_stop.get("osm_stop_name"))
         if osm_name:
             return osm_name
 
+        stop_name = normalize(
+            terminal_stop.get("stop_name")
+            or terminal_stop.get("gtfs_stop_name")
+        )
+        if stop_name:
+            return stop_name
+
+    # GTFS headsign is the final fallback only when the terminal stop itself
+    # has no usable OSM or GTFS name.
     headsigns = [
         normalize(value)
         for value in direction.get("headsigns", [])
@@ -781,12 +794,6 @@ def choose_direction_name(
 
     if headsigns:
         return Counter(headsigns).most_common(1)[0][0]
-
-    if terminal_stop:
-        return normalize(
-            terminal_stop.get("stop_name")
-            or terminal_stop.get("gtfs_stop_name")
-        )
 
     return ""
 
