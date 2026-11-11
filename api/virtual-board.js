@@ -860,9 +860,9 @@ function buildBoard(
     new Map();
 
   // Keep every current TripUpdate descriptor and its timing updates, even
-  // when it has no StopTimeUpdate for the selected stop. The service checks
-  // whether trip-level delay or an upstream StopTimeUpdate actually covers
-  // this stop. A descriptor by itself must not hide the GTFS fallback.
+  // when it has no StopTimeUpdate for the selected stop. The service uses
+  // course-level realtime timing to suppress only that exact course's GTFS
+  // fallback; a bare descriptor without timing data does not suppress it.
   const realtimeTrips = new Map();
 
   for (

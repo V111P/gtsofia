@@ -362,9 +362,9 @@ assert.equal(suppressPassedRealtimeFallbacks(disappearedCourseSnapshot, disappea
   .routes.flatMap(route => route.times).length, 0,
 'a completely disappeared realtime course must not be resurrected by its later timetable time');
 
-// A descriptor still present in the feed is not considered gone merely
-// because it has no prediction for this stop (e.g. its updates cover a later
-// route segment only). In that case the per-stop GTFS fallback remains valid.
+// Browser history must not infer passage or disappearance merely because a
+// descriptor has no prediction for this stop. Course-wide fallback suppression
+// is handled by the API; this only tests the client's history reconciliation.
 const partialCoverageStopId = 'PARTIAL-COVERAGE-STOP';
 const partialCoverageAt = 14 * 3600 + 38 * 60;
 rememberRealtimeArrivalPredictions({
@@ -398,7 +398,7 @@ assert.equal(reconcileRealtimeCoursePresence(partialCoverageSnapshot, partialCov
 'a realtime descriptor still present in the current feed must not be retired due to a local stop coverage gap');
 assert.equal(suppressPassedRealtimeFallbacks(partialCoverageSnapshot, partialCoverageStopId, partialCoverageAt + 20)
   .routes.flatMap(route => route.times).length, 1,
-'GTFS fallback must remain visible when the descriptor still exists but has no usable stop prediction');
+'client history must not remove a supplied fallback when the descriptor does not prove that the vehicle passed or disappeared');
 
 const noDataStopId = 'NO-DATA-STOP';
 rememberRealtimeArrivalPredictions({
@@ -428,7 +428,7 @@ assert.equal(reconcileRealtimeCoursePresence(noDataSnapshot, noDataStopId, parti
 'explicit NO_DATA at the selected stop is a local coverage gap, not proof that the vehicle passed');
 assert.equal(suppressPassedRealtimeFallbacks(noDataSnapshot, noDataStopId, partialCoverageAt + 20)
   .routes.flatMap(route => route.times).length, 1,
-'GTFS fallback must remain available for an explicit NO_DATA update at the selected stop');
+'client history must not treat explicit NO_DATA as proof that the vehicle passed the selected stop');
 
 // A failed upstream request is not evidence that a vehicle disappeared from
 // the feed. Retain the ordinary GTFS fallback in that case.
@@ -651,9 +651,9 @@ const secondIntegrationFeed = integrationService.buildBoard({
 }, 'EARLY42', secondIntegrationNow);
 assert.equal(secondIntegrationFeed.realtime_courses[0]?.stop_update_state, 'downstream-only',
   'the second feed must show that the same course now has timed updates only downstream of the selected stop');
-assert.ok(secondIntegrationFeed.routes.some(route => route.times.some(time => time.scheduled
+assert.ok(!secondIntegrationFeed.routes.some(route => route.times.some(time => time.scheduled
   && time.trip_start_time === '14:00:00')),
-  'the service layer should still generate the GTFS fallback before browser history reconciles the early course');
+  'the service layer must suppress the matching course fallback as soon as partial downstream realtime data is present');
 const secondIntegrationSnapshot = {
   ...secondIntegrationFeed,
   realtime_status: 'available',

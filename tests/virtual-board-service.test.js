@@ -464,9 +464,15 @@ assert.ok(laterSegmentOnlyBoard.realtime_courses.some(course =>
 assert.ok(laterSegmentOnlyBoard.realtime_courses.some(course =>
   course.trip_id === 'GTFS-TRIP-A' && course.stop_update_state === 'downstream-only'),
 'a TripUpdate with timed updates only after the selected stop must be marked as downstream-only');
-assert.ok(laterSegmentOnlyBoard.routes.some(route => route.times.some(time => time.scheduled
-  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000))),
-'a course with realtime data only downstream must keep its GTFS fallback at the selected earlier stop');
+const laterSegmentOnlyTimes = laterSegmentOnlyBoard.routes
+  .filter(route => route.route_id === 'TB7')
+  .flatMap(route => route.times);
+assert.ok(!laterSegmentOnlyTimes.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+'a partial downstream realtime update must suppress the matching course fallback even at an earlier stop');
+assert.ok(laterSegmentOnlyTimes.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:50:00+02:00') / 1000)),
+'suppressing a partial realtime course must leave the next static course on the same line visible');
 
 // Once that early realtime estimate has already passed, the feed may retain
 // the TripUpdate descriptor but no longer produce a displayable arrival row.
@@ -621,9 +627,37 @@ assert.ok(
   'a one-minute scheduled-time difference must not suppress a distinct static course'
 );
 
-// A TripUpdate descriptor alone does not cover every stop on its route.
-// Until a stop-specific or propagated realtime prediction reaches this stop,
-// keep the exact GTFS course as a per-stop fallback.
+// A partial update can still be matched safely when the producer omits Trip ID,
+// start_time and stop_id but provides stop_sequence plus an exact scheduled event
+// time (timestamp minus delay).
+const sequenceOnlyPartialNoIdBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    route_id: 'TB7',
+    direction_id: 'D1',
+    schedule_relationship: 0,
+    stop_time_updates: [{
+      stop_sequence: 3,
+      arrival: {
+        timestamp: Date.parse('2026-10-30T14:04:00+02:00') / 1000,
+        delay: 60
+      }
+    }]
+  }]
+}, '0200', now);
+const sequenceOnlyPartialTimes = sequenceOnlyPartialNoIdBoard.routes
+  .filter(route => route.route_id === 'TB7')
+  .flatMap(route => route.times);
+assert.ok(!sequenceOnlyPartialTimes.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+'a sequence-only partial realtime update must suppress its exact course fallback without Trip ID or start_time');
+assert.ok(sequenceOnlyPartialTimes.some(time => time.scheduled
+  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:50:00+02:00') / 1000)),
+'sequence-only partial realtime matching must not suppress the next course on the same line');
+
+// A bare TripUpdate descriptor identifies a course but has no realtime
+// timing data. Keep its GTFS fallback until at least one timed update exists.
 const realtimeCourseWithoutStopPrediction = service.buildBoard({
   status: 'empty',
   generated_at: Math.floor(now.getTime() / 1000),
@@ -755,8 +789,12 @@ assert.ok(
   'NO_DATA must stop delay propagation rather than inventing a downstream realtime estimate'
 );
 assert.ok(
-  noDataClearsDelayTimes.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
-  'when NO_DATA clears realtime coverage before the selected stop, the scheduled time must be used as fallback'
+  !noDataClearsDelayTimes.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:40:00+02:00') / 1000)),
+  'a course with a trip-level realtime delay must not reappear as static fallback after NO_DATA clears downstream inference'
+);
+assert.ok(
+  noDataClearsDelayTimes.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T13:50:00+02:00') / 1000)),
+  'NO_DATA handling must not suppress unrelated later courses on the same line'
 );
 
 // An expired realtime prediction is retained only for a short ten-second
@@ -984,9 +1022,9 @@ assert.equal(actualTrolley.terminal_stop_id, actualTerminalId, 'the API must rep
 // stop time is 0803 (ж.к. Банишора), before the full D1 terminal 0610. Those
 // trips must not be displayed on a board at 0803, while full trips continuing
 // to 0610 must remain visible there.
-// The checked-in service calendar starts on 2026-11-10; use a covered date so
-// this test checks terminal handling rather than an intentionally inactive day.
-const actualShortTurnBoard = actual.buildBoard({ routes: [], skipped_trips: [] }, '0803', new Date('2026-11-10T20:00:00+02:00'));
+// Use the current checked-in calendar's first covered date so this test
+// checks terminal handling rather than an intentionally inactive day.
+const actualShortTurnBoard = actual.buildBoard({ routes: [], skipped_trips: [] }, '0803', new Date('2026-11-11T20:00:00+02:00'));
 const actualShortTurnRows = actualShortTurnBoard.routes.filter(route => route.route_id === 'TB7');
 assert.ok(actualShortTurnRows.some(route => route.terminal_stop_id === '0610'), 'full TB7 trips continuing beyond 0803 must remain visible');
 assert.ok(
@@ -1008,10 +1046,10 @@ const tm22Course = (actualSchedules.TM22?.D2?.weekday || []).find(row =>
 );
 assert.ok(tm22Course, 'production GTFS must contain the selected full tram 22 course');
 assert.deepEqual(tm22Indexes.map(index => tm22Course.times[index]), ['05:06:00', '05:20:00', '05:37:00', '05:47:00']);
-const tm22TripDate = '20261110';
-const tm22NowBefore2086 = new Date('2026-11-10T05:10:00+02:00');
-const tm22UpdateAt0470 = Date.parse('2026-11-10T05:38:00+02:00') / 1000;
-const tm22UpdateAt2023 = Date.parse('2026-11-10T05:48:00+02:00') / 1000;
+const tm22TripDate = '20261111';
+const tm22NowBefore2086 = new Date('2026-11-11T05:10:00+02:00');
+const tm22UpdateAt0470 = Date.parse('2026-11-11T05:38:00+02:00') / 1000;
+const tm22UpdateAt2023 = Date.parse('2026-11-11T05:48:00+02:00') / 1000;
 const tm22RealtimeTrip = {
   trip_id: tm22Course.original_trip_id,
   route_id: 'TM22',
@@ -1037,13 +1075,12 @@ const tm22FallbackAt2086 = tm22BoardAt2086.routes
   .filter(route => route.route_id === 'TM22')
   .flatMap(route => route.times);
 assert.ok(
-  tm22FallbackAt2086.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-11-10T05:20:00+02:00') / 1000)),
-  'tram 22 at 2086 must use its GTFS time when the realtime updates begin at the later stop 0470'
+  !tm22FallbackAt2086.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-11-11T05:20:00+02:00') / 1000)),
+  'tram 22 at 2086 must suppress the exact course fallback when partial realtime data exists only at the later stop 0470'
 );
 assert.ok(
-  tm22FallbackAt2086.some(time => time.scheduled && time.trip_id === tm22Course.original_trip_id
-    && time.trip_start_time === tm22Course.start_time),
-  'GTFS fallback arrivals must retain the exact scheduled trip identity for passed-realtime suppression'
+  tm22FallbackAt2086.some(time => time.scheduled && time.timestamp > Date.parse('2026-11-11T05:20:00+02:00') / 1000),
+  'suppressing the partial realtime tram 22 course must preserve later scheduled courses'
 );
 const tm22BoardAt0470 = actual.buildBoard({
   routes: [], skipped_trips: [], realtime_trips: [tm22RealtimeTrip]
@@ -1061,16 +1098,16 @@ assert.equal(tm22RealtimeAt0470.terminal_stop_id, '2023', 'the destination must 
 assert.equal(tm22RealtimeAt0470.destination, 'Автостанция Изток', 'the full-course destination must resolve to the terminal stop name');
 const tm22BoardAt0633 = actual.buildBoard({
   routes: [], skipped_trips: [], realtime_trips: [tm22RealtimeTrip]
-}, '0633', new Date('2026-11-10T05:04:00+02:00'));
+}, '0633', new Date('2026-11-11T05:04:00+02:00'));
 assert.ok(
-  tm22BoardAt0633.routes.some(route => route.route_id === 'TM22'
-    && route.times.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-11-10T05:06:00+02:00') / 1000))),
-  'tram 22 at 0633 must also retain the GTFS time when no realtime update covers this earlier segment'
+  !tm22BoardAt0633.routes.some(route => route.route_id === 'TM22'
+    && route.times.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(Date.parse('2026-11-11T05:06:00+02:00') / 1000))),
+  'tram 22 at 0633 must suppress the matching GTFS course when partial realtime updates exist later on the same trip'
 );
 
 // Regression for stop 1411 / bus 190: the 12:27 course reaches the selected
-// stop at 12:33. An update that starts only at the following stop must not
-// suppress the 12:33 GTFS fallback for this earlier stop.
+// stop at 12:33. An update at the following stop is partial realtime data for
+// this exact course, so its earlier GTFS fallback must also be suppressed.
 const actual190Route = actualRoutes.find(route => route.route_id === 'A277');
 assert.ok(actual190Route, 'the production data must contain bus 190');
 const actual190Direction = Object.entries(actualDirections.A277 || {}).find(([directionKey, direction]) =>
@@ -1083,18 +1120,18 @@ const [actual190DirectionKey, actual190DirectionData] = actual190Direction;
 const actual190StopIndex = actual190DirectionData.pattern.map(String).indexOf('1411');
 const actual190Course = actualSchedules.A277[actual190DirectionKey].weekday.find(row => row.start_time === '12:27:00');
 assert.equal(actual190Course.times[actual190StopIndex], '12:33:00');
-const actual190Now = new Date('2026-11-10T12:15:00+02:00');
-const actual190ScheduledTimestamp = Date.parse('2026-11-10T12:33:00+02:00') / 1000;
+const actual190Now = new Date('2026-11-11T12:15:00+02:00');
+const actual190ScheduledTimestamp = Date.parse('2026-11-11T12:33:00+02:00') / 1000;
 const actual190NextStopIndex = actual190StopIndex + 1;
 const actual190LaterStopTime = actual190Course.times[actual190NextStopIndex];
-const actual190LaterStopTimestamp = Date.parse(`2026-11-10T${actual190LaterStopTime}+02:00`) / 1000;
+const actual190LaterStopTimestamp = Date.parse(`2026-11-11T${actual190LaterStopTime}+02:00`) / 1000;
 const actual190BoardWithLaterStopOnly = actual.buildBoard({
   routes: [],
   skipped_trips: [],
   realtime_trips: [{
     trip_id: actual190Course.original_trip_id,
     route_id: 'A277',
-    trip_start_date: '20261110',
+    trip_start_date: '20261111',
     trip_start_time: actual190Course.start_time,
     schedule_relationship: 0,
     schedule_relationship_name: 'SCHEDULED',
@@ -1108,19 +1145,19 @@ const actual190StaticTimes = actual190BoardWithLaterStopOnly.routes
   .filter(route => route.route_id === 'A277')
   .flatMap(route => route.times);
 assert.ok(
-  actual190StaticTimes.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(actual190ScheduledTimestamp)),
-  'the 12:33 bus 190 timetable course must remain visible when its TripUpdate starts only after the selected stop'
+  !actual190StaticTimes.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(actual190ScheduledTimestamp)),
+  'the 12:33 bus 190 fallback must be suppressed when the same course has a partial realtime update at the following stop'
 );
 assert.ok(
   actual190StaticTimes.some(time => time.scheduled && time.timestamp > actual190ScheduledTimestamp),
-  'later bus 190 courses must remain available from the timetable'
+  'suppressing the partial realtime bus 190 course must leave later courses available from the timetable'
 );
 
 // A time-only update at the first stop is enough to infer a downstream arrival
 // before the vehicle reaches stop 1411. This is the path affected when the
 // protobuf uncertainty field was previously decoded as scheduled_time.
 const actual190OriginIndex = 0;
-const actual190OriginScheduledTimestamp = Date.parse(`2026-11-10T${actual190Course.times[actual190OriginIndex]}+02:00`) / 1000;
+const actual190OriginScheduledTimestamp = Date.parse(`2026-11-11T${actual190Course.times[actual190OriginIndex]}+02:00`) / 1000;
 const actual190OriginEventTimestamp = actual190OriginScheduledTimestamp + 30;
 const actual190BoardWithOriginPrediction = actual.buildBoard({
   routes: [],
@@ -1128,7 +1165,7 @@ const actual190BoardWithOriginPrediction = actual.buildBoard({
   realtime_trips: [{
     trip_id: actual190Course.original_trip_id,
     route_id: 'A277',
-    trip_start_date: '20261110',
+    trip_start_date: '20261111',
     trip_start_time: actual190Course.start_time,
     schedule_relationship: 0,
     schedule_relationship_name: 'SCHEDULED',

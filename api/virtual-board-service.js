@@ -426,6 +426,54 @@ function createDataContext(data = {}) {
       || (wantedDirectionId ? collectMatches(false) : null);
   }
 
+  function findStaticScheduleInfoByStopSequenceScheduledTime(routeId, stopSequence, scheduledTimestamp, directionId, now) {
+    const wantedRouteId = String(routeId ?? '').trim();
+    const wantedSequence = optionalFiniteNumber(stopSequence);
+    const wantedTimestamp = optionalFiniteNumber(scheduledTimestamp);
+    const wantedDirectionId = String(directionId ?? '').trim();
+    if (!wantedRouteId || wantedSequence === null || wantedTimestamp === null) return null;
+
+    const dayType = getScheduleDayType(now, calendar);
+    const routeSchedules = schedules?.[wantedRouteId] || {};
+    const dayOrder = [dayType, dayType === 'weekday' ? 'weekend' : 'weekday'];
+
+    const collectMatches = enforceDirection => {
+      for (const currentDayType of dayOrder) {
+        const matches = [];
+        for (const [directionKey, daySchedules] of Object.entries(routeSchedules)) {
+          const direction = directions?.[wantedRouteId]?.[directionKey];
+          if (!direction) continue;
+          const actualDirectionId = String(direction.direction_id ?? '').trim();
+          if (enforceDirection && wantedDirectionId && actualDirectionId
+            && actualDirectionId !== wantedDirectionId) continue;
+
+          const rows = Array.isArray(daySchedules?.[currentDayType]) ? daySchedules[currentDayType] : [];
+          for (const schedule of rows) {
+            const stopIndex = (Array.isArray(schedule?.stop_sequences) ? schedule.stop_sequences : [])
+              .findIndex(value => Number(value) === wantedSequence);
+            if (stopIndex < 0) continue;
+            const serviceId = String(schedule?.service_id || direction?.service_id || '').trim();
+            if (serviceId && now instanceof Date && !isServiceActive(serviceId, now, calendar)) continue;
+            const seconds = parseGtfsTime(schedule?.times?.[stopIndex]);
+            if (seconds === null) continue;
+            const expectedTimestamp = gtfsSecondsToTodayTimestamp(seconds, now);
+            if (Math.abs(expectedTimestamp - wantedTimestamp) > 1) continue;
+            const info = makeStaticScheduleInfo(wantedRouteId, directionKey, schedule);
+            if (info) matches.push(info);
+          }
+        }
+
+        const uniqueMatch = resolveUniqueStaticScheduleMatch(matches);
+        if (uniqueMatch && matches.length === 1) return uniqueMatch;
+        if (matches.length) return null;
+      }
+      return null;
+    };
+
+    return collectMatches(true)
+      || (wantedDirectionId ? collectMatches(false) : null);
+  }
+
   function getRealtimeScheduledTimeEntries(realtimeTrip, fallbackStopId = '') {
     const candidates = [];
     for (const event of Array.isArray(realtimeTrip?.times) ? realtimeTrip.times : []) {
@@ -433,9 +481,10 @@ function createDataContext(data = {}) {
     }
     for (const update of Array.isArray(realtimeTrip?.stop_time_updates) ? realtimeTrip.stop_time_updates : []) {
       const stopId = String(update?.stop_id || '').trim();
-      if (!stopId) continue;
+      const stopSequence = optionalFiniteNumber(update?.stop_sequence);
+      if (!stopId && stopSequence === null) continue;
       for (const event of [update?.arrival, update?.departure].filter(Boolean)) {
-        candidates.push({ stop_id: stopId, event });
+        candidates.push({ stop_id: stopId, stop_sequence: stopSequence, event });
       }
     }
 
@@ -443,7 +492,8 @@ function createDataContext(data = {}) {
     const results = [];
     for (const candidate of candidates) {
       const stopId = String(candidate.stop_id || '').trim();
-      if (!stopId) continue;
+      const stopSequence = optionalFiniteNumber(candidate.stop_sequence);
+      if (!stopId && stopSequence === null) continue;
       const event = candidate.event;
       const explicitScheduled = optionalFiniteNumber(event?.scheduled_time);
       const timestamp = optionalFiniteNumber(event?.timestamp);
@@ -452,10 +502,10 @@ function createDataContext(data = {}) {
         ? explicitScheduled
         : (timestamp !== null && delay !== null ? timestamp - delay : null);
       if (scheduledTimestamp === null) continue;
-      const key = `${normalizeStopKey(stopId)}|${scheduledTimestamp}`;
+      const key = `${normalizeStopKey(stopId)}|${stopSequence ?? ''}|${scheduledTimestamp}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      results.push({ stop_id: stopId, timestamp: scheduledTimestamp });
+      results.push({ stop_id: stopId, stop_sequence: stopSequence, timestamp: scheduledTimestamp });
     }
     return results;
   }
@@ -463,7 +513,8 @@ function createDataContext(data = {}) {
   // Resolve a realtime TripDescriptor to the canonical GTFS course. Exact
   // Trip ID is preferred, followed by a unique exact route + start_time match.
   // If start_time is absent, an exact scheduled event at any StopTimeUpdate
-  // location can identify the course. No fuzzy time-proximity match is allowed.
+  // location (stop_id or stop_sequence) can identify the course. No fuzzy
+  // time-proximity match is allowed.
   function findStaticScheduleInfoForRealtime(routeId, tripId, startTime, directionId, now, stopId, scheduledTimes = []) {
     const wantedRouteId = String(routeId ?? '').trim();
     const wantedTripId = String(tripId ?? '').trim();
@@ -487,29 +538,36 @@ function createDataContext(data = {}) {
       if (byStartTime) return byStartTime;
     }
 
-    if (!wantedRouteId || !stopId) return null;
+    if (!wantedRouteId) return null;
     for (const scheduledEntry of scheduledTimes) {
-      const eventStopId = String(
-        scheduledEntry && typeof scheduledEntry === 'object'
-          ? scheduledEntry.stop_id
-          : stopId
-      ).trim();
-      const timestamp = optionalFiniteNumber(
-        scheduledEntry && typeof scheduledEntry === 'object'
-          ? scheduledEntry.timestamp
-          : scheduledEntry
-      );
-      if (!eventStopId || timestamp === null) continue;
-      const byStopTime = findStaticScheduleInfoByStopScheduledTime(
-        wantedRouteId,
-        eventStopId,
-        timestamp,
-        directionId,
-        now
-      );
-      if (byStopTime && (!wantedStartTime
-        || String(byStopTime.schedule?.start_time || '').trim() === wantedStartTime)) {
-        return byStopTime;
+      const isObjectEntry = scheduledEntry && typeof scheduledEntry === 'object';
+      const eventStopId = String(isObjectEntry ? scheduledEntry.stop_id : stopId).trim();
+      const stopSequence = optionalFiniteNumber(isObjectEntry ? scheduledEntry.stop_sequence : null);
+      const timestamp = optionalFiniteNumber(isObjectEntry ? scheduledEntry.timestamp : scheduledEntry);
+      if (timestamp === null) continue;
+
+      const byStopTime = eventStopId
+        ? findStaticScheduleInfoByStopScheduledTime(
+          wantedRouteId,
+          eventStopId,
+          timestamp,
+          directionId,
+          now
+        )
+        : null;
+      const bySequenceTime = stopSequence !== null
+        ? findStaticScheduleInfoByStopSequenceScheduledTime(
+          wantedRouteId,
+          stopSequence,
+          timestamp,
+          directionId,
+          now
+        )
+        : null;
+      const mappedInfo = byStopTime || bySequenceTime;
+      if (mappedInfo && (!wantedStartTime
+        || String(mappedInfo.schedule?.start_time || '').trim() === wantedStartTime)) {
+        return mappedInfo;
       }
     }
     return null;
@@ -1018,27 +1076,26 @@ function createDataContext(data = {}) {
     // is deliberately exact (not the former +/-120s guess), and it is used
     // only when that route/time identifies one static course unambiguously.
     const eventMatchStaticTripId = String(staticArrival?.original_trip_id || '').trim();
-    const realtimeTimes = Array.isArray(realtimeTrip?.times) ? realtimeTrip.times : [];
-    for (const time of realtimeTimes) {
-      const explicitScheduled = optionalFiniteNumber(time?.scheduled_time);
-      const realtimeTimestamp = optionalFiniteNumber(time?.timestamp);
-      const delay = optionalFiniteNumber(time?.delay);
-      const inferredScheduled = explicitScheduled !== null
-        ? explicitScheduled
-        : (realtimeTimestamp !== null && delay !== null ? realtimeTimestamp - delay : null);
-      if (inferredScheduled === null) continue;
-
-      const matchingStaticCourses = allStaticArrivals.filter(candidate => {
-        if (String(candidate?.route_id || '').trim() !== staticRouteId) return false;
-        const candidateDirectionId = String(candidate?.direction_id || '').trim();
-        if (realtimeDirectionId && candidateDirectionId && candidateDirectionId !== realtimeDirectionId) return false;
-        return (Array.isArray(candidate?.times) ? candidate.times : []).some(
-          candidateTime => optionalFiniteNumber(candidateTime?.timestamp) === inferredScheduled
-        );
-      });
-
-      if (matchingStaticCourses.length === 1
-        && String(matchingStaticCourses[0]?.original_trip_id || '').trim() === eventMatchStaticTripId) {
+    const scheduledStopTimes = getRealtimeScheduledTimeEntries(realtimeTrip, selectedStopId);
+    for (const scheduledEntry of scheduledStopTimes) {
+      const mappedInfo = scheduledEntry.stop_id
+        ? findStaticScheduleInfoByStopScheduledTime(
+          staticRouteId,
+          scheduledEntry.stop_id,
+          scheduledEntry.timestamp,
+          realtimeDirectionId,
+          now
+        )
+        : (scheduledEntry.stop_sequence !== null
+          ? findStaticScheduleInfoByStopSequenceScheduledTime(
+            staticRouteId,
+            scheduledEntry.stop_sequence,
+            scheduledEntry.timestamp,
+            realtimeDirectionId,
+            now
+          )
+          : null);
+      if (String(mappedInfo?.schedule?.original_trip_id || '').trim() === eventMatchStaticTripId) {
         return true;
       }
     }
@@ -1071,100 +1128,46 @@ function createDataContext(data = {}) {
     return candidateTripIds.size === 1 && candidateTripIds.has(staticOriginalTripId);
   }
 
-  function realtimeTripCoversStaticStop(staticArrival, realtimeTrip, selectedStopId, now) {
+  function realtimeTripHasCourseData(realtimeTrip) {
     const relationshipName = String(realtimeTrip?.schedule_relationship_name || '').trim().toUpperCase();
     const relationship = optionalFiniteNumber(realtimeTrip?.schedule_relationship);
 
-    // Canceled/deleted scheduled trips must not reappear from the timetable.
+    // Canceled/deleted scheduled trips are explicit realtime information and
+    // must never reappear from the timetable.
     if (relationshipName === 'CANCELED' || relationshipName === 'DELETED'
       || relationship === 3 || relationship === 7) {
       return true;
     }
 
     // Only a scheduled TripUpdate can replace a normal GTFS timetable course.
+    // ADDED / DUPLICATED / other non-scheduled instances must not hide the
+    // original scheduled course merely because they reuse its route or Trip ID.
     if (relationshipName && relationshipName !== 'SCHEDULED') return false;
     if (relationship !== null && relationship !== 0) return false;
 
-    const routeId = String(staticArrival?.route_id || realtimeTrip?.route_id || '').trim();
-    const originalTripId = String(staticArrival?.original_trip_id || '').trim();
-    const dayType = getScheduleDayType(now, calendar);
-    const staticInfo = findStaticScheduleInfo(routeId, originalTripId, dayType)
-      || (!originalTripId
-        ? findStaticScheduleInfoByStartTime(
-          routeId,
-          staticArrival?.trip_start_time || realtimeTrip?.trip_start_time || realtimeTrip?.start_time,
-          staticArrival?.direction_id || realtimeTrip?.direction_id,
-          now
-        )
-        : null);
-    if (!staticInfo) return false;
+    // Realtime ownership is course-wide, not stop-wide. A trip-level delay or
+    // one timed StopTimeUpdate anywhere along the course is enough to disable
+    // its GTFS fallback at every stop. This also covers partial TripUpdates
+    // that currently contain data only for a later/earlier segment.
+    if (optionalFiniteNumber(realtimeTrip?.trip_delay) !== null) return true;
 
-    const pattern = Array.isArray(staticInfo.direction?.pattern)
-      ? staticInfo.direction.pattern.map(String)
-      : [];
-    const targetIndex = Number.isInteger(staticArrival?.stop_index)
-      ? staticArrival.stop_index
-      : pattern.findIndex(id => stopIdsMatch(id, selectedStopId));
-    if (targetIndex < 0 || targetIndex > staticInfo.terminalIndex) return false;
+    const hasTiming = event => event
+      && (optionalFiniteNumber(event.timestamp) !== null
+        || optionalFiniteNumber(event.delay) !== null);
 
-    // A trip-level delay is valid from the beginning of the trip until a
-    // NO_DATA update clears it. In the absence of such information, a
-    // descriptor alone is not realtime coverage for every stop on the route.
-    // API parser route records contain stop-specific arrivals for the board
-    // stop. Even if that prediction has already passed (and was therefore
-    // omitted from the rendered realtime rows), it still owns this stop and
-    // must prevent the old scheduled time from reappearing.
-    const directStopTimes = Array.isArray(realtimeTrip?.times) ? realtimeTrip.times : [];
-    if (directStopTimes.some(time =>
-      optionalFiniteNumber(time?.timestamp) !== null
-      || optionalFiniteNumber(time?.delay) !== null
-    )) {
+    if ((Array.isArray(realtimeTrip?.times) ? realtimeTrip.times : []).some(hasTiming)) {
       return true;
     }
 
-    let knownDelay = optionalFiniteNumber(realtimeTrip?.trip_delay);
-    const updates = (Array.isArray(realtimeTrip?.stop_time_updates) ? realtimeTrip.stop_time_updates : [])
-      .map((update, sourceIndex) => ({
-        update,
-        sourceIndex,
-        stopIndex: getRealtimeUpdateStopIndex(update, staticInfo)
-      }))
-      .filter(item => item.stopIndex >= 0 && item.stopIndex <= targetIndex)
-      .sort((left, right) => left.stopIndex - right.stopIndex || left.sourceIndex - right.sourceIndex);
-
-    for (const item of updates) {
-      const isTargetStop = item.stopIndex === targetIndex;
-      const stopRelationship = optionalFiniteNumber(item.update?.schedule_relationship) ?? 0;
-
-      if (stopRelationship === 2) { // NO_DATA: use the timetable at this stop and downstream until a new event appears.
-        knownDelay = null;
-        if (isTargetStop) return false;
-        continue;
-      }
-
-      if (stopRelationship === 1) { // SKIPPED is handled separately and must not erase delay propagation.
-        if (isTargetStop) return true;
-        continue;
-      }
-
-      const event = getRealtimeEvent(item.update, !isTargetStop);
-      if (!event) continue;
-
-      const eventDelay = getRealtimeEventDelay(event, item.stopIndex, staticInfo.schedule, now);
-      if (eventDelay !== null) knownDelay = eventDelay;
-
-      // A direct target-stop prediction is coverage even when it has already
-      // passed or is outside the display horizon. Otherwise the old timetable
-      // time could reappear as a duplicate arrival.
-      if (isTargetStop) {
-        const directTimestamp = optionalFiniteNumber(event.timestamp);
-        const directDelay = optionalFiniteNumber(event.delay);
-        if (directTimestamp !== null || directDelay !== null) return true;
-        return knownDelay !== null;
-      }
-    }
-
-    return knownDelay !== null;
+    return (Array.isArray(realtimeTrip?.stop_time_updates) ? realtimeTrip.stop_time_updates : [])
+      .some(update => {
+        const stopRelationship = optionalFiniteNumber(update?.schedule_relationship);
+        // SKIPPED is itself an explicit realtime instruction, even without a
+        // timestamp. NO_DATA is not: it explicitly says no realtime event is
+        // available and must not, by itself, suppress a timetable fallback.
+        if (stopRelationship === 1) return true;
+        return hasTiming(update?.arrival) || hasTiming(update?.departure);
+      });
   }
 
   function staticArrivalIsCovered(staticArrival, realtimeRoutes, realtimeTrips, now, allStaticArrivals, selectedStopId) {
@@ -1172,7 +1175,7 @@ function createDataContext(data = {}) {
 
     for (const realtimeTrip of realtimeTrips) {
       if (!staticArrivalMatchesRealtimeDescriptor(staticArrival, realtimeTrip, now, allStaticArrivals, selectedStopId)) continue;
-      if (realtimeTripCoversStaticStop(staticArrival, realtimeTrip, selectedStopId, now)) return true;
+      if (realtimeTripHasCourseData(realtimeTrip)) return true;
     }
 
     // A stop-specific realtime route already contains a usable arrival for
@@ -1239,9 +1242,9 @@ function createDataContext(data = {}) {
     const isMetro = /^M/i.test(selectedStopId) || /^M/i.test(String(selectedStop?.stop_code || ''));
     const rawRealtimeRoutes = isMetro ? [] : (Array.isArray(realtimeBoard?.routes) ? realtimeBoard.routes : []);
     // Complete TripUpdate descriptors are supplied separately from arrivals
-    // at this stop. The service matches the exact course, then checks whether
-    // realtime information reaches this particular stop before replacing its
-    // GTFS timetable time.
+    // at this stop. The service matches the exact course and uses any actual
+    // timed realtime data for that course to suppress its GTFS fallback, even
+    // when the feed currently contains updates for only part of the route.
     const realtimeTrips = isMetro ? [] : [
       ...(Array.isArray(realtimeBoard?.realtime_trips) ? realtimeBoard.realtime_trips : []),
       ...rawRealtimeRoutes
