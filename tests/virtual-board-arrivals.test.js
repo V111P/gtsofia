@@ -672,4 +672,117 @@ assert.ok(!integratedTimes.some(time => time.scheduled && time.trip_start_time =
 assert.ok(integratedTimes.some(time => time.scheduled && time.trip_start_time === '14:10:00'),
   'the next scheduled course must remain visible after suppressing the early-running course');
 
+// Some GTFS-RT producers express an after-midnight course against the
+// previous service day (24:10), while the static timetable/browser identity
+// may express the same absolute stop event against the current day (00:10).
+// The exact absolute scheduled passage at this stop must bridge that metadata
+// difference, but not if the terminal/direction identifies another course.
+const midnightScheduledStopTime = Date.parse('2026-11-11T00:10:00+02:00') / 1000;
+assert.equal(
+  sameArrivalTrip(
+    { stop_id: 'MIDNIGHT-STOP', route_id: 'TB42', trip_id: 'OLD-RT-ID',
+      trip_start_date: '20261110', trip_start_time: '24:10:00', direction_id: 'D1',
+      terminal_stop_id: 'TERM-A', scheduled_time: midnightScheduledStopTime },
+    { stop_id: 'MIDNIGHT-STOP', route_id: 'TB42', trip_id: 'NEW-GTFS-ID',
+      trip_start_date: '20261111', trip_start_time: '00:10:00', direction_id: 'D1',
+      terminal_stop_id: 'TERM-A', scheduled_time: midnightScheduledStopTime }
+  ),
+  true,
+  'the same exact absolute stop event must match across different service-date/start-time encodings'
+);
+assert.equal(
+  sameArrivalTrip(
+    { stop_id: 'MIDNIGHT-STOP', route_id: 'TB42', trip_id: 'OLD-RT-ID',
+      trip_start_date: '20261110', trip_start_time: '24:10:00', direction_id: 'D1',
+      terminal_stop_id: 'TERM-A', scheduled_time: midnightScheduledStopTime },
+    { stop_id: 'MIDNIGHT-STOP', route_id: 'TB42', trip_id: 'NEW-GTFS-ID',
+      trip_start_date: '20261111', trip_start_time: '00:10:00', direction_id: 'D1',
+      terminal_stop_id: 'TERM-B', scheduled_time: midnightScheduledStopTime }
+  ),
+  false,
+  'an exact stop-time alias must not merge courses with different terminals'
+);
+
+const midnightRealtimeAt = Date.parse('2026-11-11T00:07:00+02:00') / 1000;
+const midnightObservedEta = Date.parse('2026-11-11T00:08:00+02:00') / 1000;
+const midnightRefreshAt = Date.parse('2026-11-11T00:09:00+02:00') / 1000;
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    route_id: 'TB42', trip_id: 'OLD-RT-ID', trip_start_date: '20261110',
+    trip_start_time: '24:10:00', direction_id: 'D1', terminal_stop_id: 'TERM-A', realtime: true,
+    times: [{ timestamp: midnightObservedEta, scheduled_time: midnightScheduledStopTime,
+      scheduled: false, source: 'realtime', trip_id: 'OLD-RT-ID',
+      trip_start_date: '20261110', trip_start_time: '24:10:00', direction_id: 'D1',
+      terminal_stop_id: 'TERM-A' }]
+  }]
+}, 'MIDNIGHT-STOP', midnightRealtimeAt);
+const midnightMissingSnapshot = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: midnightRefreshAt,
+  realtime_courses: [],
+  routes: [{
+    route_id: 'TB42',
+    times: [{ timestamp: midnightScheduledStopTime, scheduled: true,
+      source: 'static', trip_id: 'NEW-GTFS-ID', trip_start_date: '20261111',
+      trip_start_time: '00:10:00', direction_id: 'D1', terminal_stop_id: 'TERM-A' }]
+  }]
+};
+reconcileRealtimeCoursePresence(midnightMissingSnapshot, 'MIDNIGHT-STOP', midnightRefreshAt);
+assert.equal(
+  suppressPassedRealtimeFallbacks(midnightMissingSnapshot, 'MIDNIGHT-STOP', midnightRefreshAt).routes.length,
+  0,
+  'a previously observed realtime course must not resurrect as GTFS when service-date/start-time encoding changes across midnight'
+);
+
+
+
+// Once a fresh downstream-only TripUpdate has confirmed passage, a later
+// stale/reappearing target update must not clear the passed state and allow
+// the course to return through its GTFS fallback.
+const stickyStopId = 'STICKY-PASSED-STOP';
+const stickyFirstPoll = 14 * 3600 + 38 * 60;
+const stickyCourse = {
+  route_id: 'TB42', trip_id: 'GTFS-STICKY-42', realtime_trip_id: 'RT-STICKY-42',
+  trip_start_date: '20261110', trip_start_time: '14:00:00', direction_id: 'D1'
+};
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    ...stickyCourse,
+    realtime: true,
+    times: [{ timestamp: stickyFirstPoll + 60, scheduled_time: stickyFirstPoll + 240,
+      scheduled: false, source: 'realtime', ...stickyCourse }]
+  }]
+}, stickyStopId, stickyFirstPoll);
+const stickyDownstreamSnapshot = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: stickyFirstPoll + 30,
+  realtime_courses: [{ ...stickyCourse, stop_update_state: 'downstream-only' }],
+  routes: []
+};
+assert.equal(reconcileRealtimeCoursePresence(stickyDownstreamSnapshot, stickyStopId, stickyFirstPoll + 30), true,
+  'a downstream-only fresh update should confirm that the previously observed course passed the stop');
+
+const staleReappearingRealtime = {
+  realtime_status: 'available',
+  realtime_feed_timestamp: stickyFirstPoll + 45,
+  realtime_courses: [{ ...stickyCourse, stop_update_state: 'target-update' }],
+  routes: [{
+    ...stickyCourse,
+    realtime: true,
+    times: [{ timestamp: stickyFirstPoll + 90, scheduled_time: stickyFirstPoll + 240,
+      scheduled: false, source: 'realtime', ...stickyCourse }]
+  }]
+};
+rememberRealtimeArrivalPredictions(staleReappearingRealtime, stickyStopId, stickyFirstPoll + 45);
+reconcileRealtimeCoursePresence(staleReappearingRealtime, stickyStopId, stickyFirstPoll + 45);
+const stickyFallbackResult = suppressPassedRealtimeFallbacks({
+  realtime_status: 'available',
+  routes: [{
+    route_id: 'TB42',
+    times: [{ timestamp: stickyFirstPoll + 240, scheduled: true, source: 'static', ...stickyCourse }]
+  }]
+}, stickyStopId, stickyFirstPoll + 50);
+assert.equal(stickyFallbackResult.routes.length, 0,
+  'a stale reappearing target update must not undo confirmed passage or resurrect the GTFS fallback');
+
 console.log('virtual-board-arrivals: presentation tests passed');
