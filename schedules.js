@@ -684,7 +684,11 @@ function renderSummary(courses) {
           selectedScheduleLine
         )}
 
-        <span class="direction-arrow" aria-hidden="true">🞂</span>
+        <img
+          class="direction-arrow"
+          src="https://raw.githubusercontent.com/V111P/gtsofia/99743b00a82d34119d970079cfe4b5dea1307ad1/Icons/destinationarrow.svg"
+          alt=""
+        />
 
         <strong class="schedule-summary-destination">
           ${escapeHtml(
