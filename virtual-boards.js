@@ -120,6 +120,9 @@
         time?.trip_start_time || route?.trip_start_time || ''
       ).trim(),
       direction_id: String(time?.direction_id || route?.direction_id || '').trim(),
+      terminal_stop_id: String(
+        time?.terminal_stop_id || route?.terminal_stop_id || route?.destination_stop_id || ''
+      ).trim(),
       // Scheduled event time is a stronger cross-version alias than a
       // producer-specific Trip ID. It lets older history entries match the
       // canonical GTFS Trip ID after backend identity normalization.
@@ -165,24 +168,37 @@
       && left.trip_start_time === right.trip_start_time);
     const hasSameDirection = Boolean(left.direction_id && right.direction_id
       && left.direction_id === right.direction_id);
+    const hasConflictingDirections = Boolean(left.direction_id && right.direction_id
+      && left.direction_id !== right.direction_id);
+    const hasConflictingTerminals = Boolean(left.terminal_stop_id && right.terminal_stop_id
+      && left.terminal_stop_id !== right.terminal_stop_id);
+
+    // The absolute scheduled passage time at this exact stop already includes
+    // the service date. It is therefore a stronger cross-version identity than
+    // TripDescriptor.start_date/start_time, which some feed variants omit or
+    // encode differently for trips crossing midnight (e.g. 24:10 vs 00:10).
+    // Keep route, stop, direction and terminal as safeguards against matching
+    // a different course that happens to use the same timetable minute.
+    const exactScheduledTimeAlias = hasSameScheduledStopTime
+      && !hasConflictingDirections
+      && !hasConflictingTerminals;
     const legacyIdAlias = hasSameStartTime && hasSameDirection && !hasConflictingScheduledTimes;
 
-    if (hasSharedTripId && !sameTripId && !hasSameScheduledStopTime && !legacyIdAlias) {
+    if (hasSharedTripId && !sameTripId && !exactScheduledTimeAlias && !legacyIdAlias) {
       // Older browser history may contain the producer's Trip ID while a
-      // newer API response carries the canonical GTFS original_trip_id. New
-      // records can match through the exact planned passage time at this stop.
-      // Legacy records without that field may match only with the stricter
-      // route + service date + exact start_time + exact direction signature.
+      // newer API response carries the canonical GTFS original_trip_id.
+      // Exact stop-time identity can bridge that difference even when the
+      // producer's service-date/start-time representation differs.
       return false;
     }
-    if (!hasSharedTripId && (!left.trip_start_time || !right.trip_start_time
+    if (!hasSharedTripId && !exactScheduledTimeAlias && (!left.trip_start_time || !right.trip_start_time
       || left.trip_start_time !== right.trip_start_time)) {
       return false;
     }
 
-    if (left.trip_start_date && right.trip_start_date
+    if (!exactScheduledTimeAlias && left.trip_start_date && right.trip_start_date
       && left.trip_start_date !== right.trip_start_date) return false;
-    if (left.trip_start_time && right.trip_start_time
+    if (!exactScheduledTimeAlias && left.trip_start_time && right.trip_start_time
       && left.trip_start_time !== right.trip_start_time) return false;
 
     // Matching Trip IDs are strongest. If the IDs conflict and we are using
@@ -378,6 +394,14 @@
           course => course.stop_update_state === 'downstream-only'
         );
         if (!passedSelectedStop) {
+          const alreadyConfirmedPassed = item?.passed_at !== null
+            && item?.passed_at !== undefined
+            && Number.isFinite(Number(item.passed_at));
+          // Once a later stop update has confirmed that this exact trip passed
+          // the selected stop, a stale/reappearing descriptor must not undo
+          // that fact on a subsequent poll.
+          if (alreadyConfirmedPassed) return item;
+
           if (item.missing_from_realtime_at !== null && item.missing_from_realtime_at !== undefined) {
             changed = true;
             return { ...item, missing_from_realtime_at: null, last_seen_realtime_at: nowSeconds };
@@ -388,8 +412,26 @@
         // If this exact course was previously shown realtime at the selected
         // stop, and the fresh TripUpdate now carries timed updates only for
         // downstream stops, the feed has advanced beyond this stop. This is
-        // stronger evidence of passage than waiting for the old ETA, which may
-        // have been several minutes late compared with the actual vehicle.
+        // strong, monotonic evidence of passage: preserve it even if a later
+        // snapshot briefly reintroduces an older target-stop update.
+        const previousPassedAt = item?.passed_at === null || item?.passed_at === undefined
+          ? null
+          : Number(item.passed_at);
+        const confirmedPassedAt = previousPassedAt !== null && Number.isFinite(previousPassedAt)
+          ? previousPassedAt
+          : nowSeconds;
+        changed = true;
+        return {
+          ...item,
+          passed_at: confirmedPassedAt,
+          passed_reason: item?.passed_reason || 'downstream-only',
+          missing_from_realtime_at: item?.missing_from_realtime_at ?? nowSeconds
+        };
+      }
+
+      if (item?.passed_at !== null && item?.passed_at !== undefined
+        && Number.isFinite(Number(item.passed_at))) {
+        return item;
       }
 
       if (item.missing_from_realtime_at !== null && item.missing_from_realtime_at !== undefined
