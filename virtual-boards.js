@@ -569,9 +569,7 @@
   ) {
     return (
       `<span class="schedule-summary-arrow direction-arrow"`
-      + ` aria-hidden="true">`
-      + `<img src="Icons/destinationarrow.svg" alt="">`
-      + `</span>`
+      + ` aria-hidden="true">🞂</span>`
       + `<strong class="schedule-summary-destination vb-destination">`
       + `${escapeHtml(destination || "—")}`
       + `</strong>`
