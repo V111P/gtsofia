@@ -49,22 +49,26 @@ export async function getArrivalsByIdentifier(code, options = {}) {
       })
     : [];
 
-  const arrivals = mergeRealtimeAndScheduledArrivals({
+  const mergedArrivals = mergeRealtimeAndScheduledArrivals({
     realtimeArrivals,
     scheduledArrivals,
     updates,
     requestedStopIds,
     stopIdentifier: code
-  }).slice(0, limit);
+  });
+  const arrivals = mergedArrivals.slice(0, limit);
 
   const realtimeCount = arrivals.filter(arrival => arrival.isRealtime === true).length;
   const scheduledCount = arrivals.filter(arrival => arrival.isScheduled === true).length;
+  const scheduledMergedCount = mergedArrivals.filter(arrival => arrival.isScheduled === true).length;
 
   return {
     arrivals,
     count: arrivals.length,
     realtimeCount,
     scheduledCount,
+    scheduledCandidateCount: scheduledArrivals.length,
+    scheduledMergedCount,
     realtimeAvailable,
     realtimeError,
     feedTimestamp: realtimeAvailable ? getRealtimeFeedTimestamp() : null,

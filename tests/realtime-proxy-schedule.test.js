@@ -104,6 +104,20 @@ const assert = require('node:assert/strict');
     'no-update-trip:schedule', 'same-trip:realtime'
   ], 'RT for the same trip/public stop suppresses duplicate timetable fallback despite different GTFS stop_id namespaces');
 
+  // Verify the checked-in generated schedule index contains usable surface
+  // timetable rows for the same public stop-code path used by Render.
+  const { getScheduleData } = await import('../realtime-proxy/lib/schedule-data.js');
+  const generatedIndex = await getScheduleData();
+  assert.ok(generatedIndex.generatedAt, 'generated timetable index has a generation date');
+  assert.ok(generatedIndex.routes?.TM22, 'generated timetable index includes tram 22');
+  const integrationNow = Date.parse(`${generatedIndex.generatedAt}T05:00:00.000Z`);
+  const generatedStopArrivals = extractScheduledArrivals(generatedIndex, '1247', {
+    nowMs: integrationNow
+  });
+  assert.ok(generatedStopArrivals.some(item => item.routeId === 'TM22'),
+    'generated schedule index resolves tram 22 times for public stop code 1247');
+  assert.ok(generatedStopArrivals.every(item => item.isScheduled && item.source === 'schedule'));
+
   console.log('realtime-proxy-schedule: timetable fallback tests passed');
 })().catch(error => {
   console.error(error);

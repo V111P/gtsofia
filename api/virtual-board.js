@@ -98,22 +98,30 @@ function getRouteForArrival(arrival) {
   };
 }
 
-function resolveOsmDestinationName(value, stops = stopsData) {
+function findStopsMatchingName(value, stops = stopsData) {
   const normalized = normalizeStopName(value);
-  if (!normalized) return '';
+  if (!normalized) return [];
   const fields = [
     'osm_full_name_bg', 'osm_stop_name', 'osm_name', 'stop_name',
     'gtfs_stop_name', 'name'
   ];
-  for (const stop of Array.isArray(stops) ? stops : []) {
-    const matches = fields.some(field => normalizeStopName(stop?.[field]) === normalized);
-    if (!matches) continue;
+  return (Array.isArray(stops) ? stops : []).filter(stop =>
+    fields.some(field => normalizeStopName(stop?.[field]) === normalized)
+  );
+}
+
+function resolveOsmDestinationName(value, stops = stopsData) {
+  // Return an OSM-backed name only when the source label can be matched to a
+  // known stop. Returning the raw GTFS headsign here would prevent the
+  // per-trip OSM destination map from being used as the fallback.
+  const matches = findStopsMatchingName(value, stops);
+  for (const stop of matches) {
     for (const field of ['osm_full_name_bg', 'osm_stop_name', 'osm_name', 'name', 'stop_name', 'gtfs_stop_name']) {
       const candidate = normalizeText(stop?.[field]);
       if (candidate) return candidate;
     }
   }
-  return normalizeText(value);
+  return '';
 }
 
 function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
@@ -165,27 +173,37 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     const realtimeDestinationMatches = realtimeDestinationCandidates.some(candidate =>
       destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
     );
+    const realtimeDestinationMatchesKnownStop = realtimeDestinationCandidates.some(candidate =>
+      findStopsMatchingName(candidate, stops).length > 0
+    );
     const staticTerminalMatches = Boolean(
       (terminalStopId && stopAliases.has(terminalStopId))
       || destinationMatchesBoardStop(terminal?.destination || arrival.destination, '', stopAliases, stopNames)
     );
 
-    // A realtime headsign describes this particular trip instance and takes
-    // precedence over the full-route static destination. Scheduled fallback
-    // rows use their own generated partial/full trip terminal.
+    // A recognized RT headsign identifies this particular trip instance and
+    // takes precedence over a full-route terminal. If the RT label is not
+    // present in the stop-name catalog, fall back to the per-trip OSM terminal
+    // mapping so a headsign formatting difference cannot disable terminal
+    // filtering. Scheduled rows use their own generated trip terminal.
     const destinationIsBoardStop = realtimeDestinationCandidates.length
-      ? realtimeDestinationMatches
+      ? (realtimeDestinationMatches || (!realtimeDestinationMatchesKnownStop && staticTerminalMatches))
       : staticTerminalMatches;
 
     // A course ending at the board stop is not an arrival there: remove the
     // complete course (line, destination and all its times) for both sources.
     if (destinationIsBoardStop) continue;
 
-    const realtimeDestination = realtimeDestinationCandidates.length
-      ? resolveOsmDestinationName(realtimeDestinationCandidates[0], stops)
-      : '';
+    const realtimeDestination = realtimeDestinationCandidates
+      .map(candidate => resolveOsmDestinationName(candidate, stops))
+      .find(Boolean) || '';
+    const scheduledOrMappedDestination = resolveOsmDestinationName(
+      terminal?.destination || arrival.destination,
+      stops
+    );
     const destination = realtimeDestination
       || normalizeText(terminal?.destination)
+      || scheduledOrMappedDestination
       || normalizeText(arrival.destination)
       || normalizeText(arrival.headsign);
     const groupKey = `${routeId}|${destination}`;
@@ -507,6 +525,9 @@ async function handler(req, res) {
         sum + route.times.filter(time => time.source === 'realtime').length, 0),
       scheduled_count: Number(proxyPayload.scheduledCount) || routes.reduce((sum, route) =>
         sum + route.times.filter(time => time.source === 'schedule').length, 0),
+      scheduled_candidate_count: Number(proxyPayload.scheduledCandidateCount) || 0,
+      scheduled_merged_count: Number(proxyPayload.scheduledMergedCount) || 0,
+      schedule_generated_at: proxyPayload.scheduleGeneratedAt || null,
       provider: 'Sofia Traffic GTFS-RT + GTFS timetable',
       routes
     });

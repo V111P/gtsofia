@@ -129,6 +129,33 @@ const osmDestination = handler.mapRealtimeArrivalsToBoard([destinationArrival], 
   stopIdentifier: '1247'
 });
 assert.equal(osmDestination[0].destination, 'Автостанция Изток', 'the direction endpoint should use the OSM-first terminal-stop name');
+
+// If a GTFS RT headsign has formatting or wording that does not exactly match
+// an OSM stop name, use the per-trip OSM-first destination map instead of
+// returning the raw GTFS text to the virtual board.
+const gtfsHeadsignFallsBackToOsm = handler.mapRealtimeArrivalsToBoard([{
+  ...destinationArrival,
+  id: 'gtfs-headsign-osm-fallback',
+  tripId: 'gtfs-headsign-osm-fallback-trip',
+  headsign: 'АВТОСТАНЦИЯ ИЗТОК (ГТФС ВАРИАНТ)'
+}], {
+  nowMs,
+  stopIdentifier: '1247',
+  stops: [
+    { stop_id: '1247', stop_code: '1247', stop_name: 'Парк', osm_stop_name: 'Парк' },
+    { stop_id: '2023', stop_code: '2023', stop_name: 'Автостанция Изток', osm_stop_name: 'Автостанция Изток' }
+  ],
+  tripDestinations: {
+    'gtfs-headsign-osm-fallback-trip': {
+      terminal_stop_id: '2023',
+      destination: 'Автостанция Изток'
+    }
+  }
+});
+assert.equal(gtfsHeadsignFallsBackToOsm[0].destination, 'Автостанция Изток',
+  'an unmatched GTFS headsign must fall back to the OSM-first per-trip destination');
+assert.equal(handler.resolveOsmDestinationName('NOT A KNOWN STOP', []), '',
+  'the OSM resolver must not masquerade an unmatched GTFS value as an OSM name');
 const hiddenTerminal = handler.mapRealtimeArrivalsToBoard([destinationArrival], {
   nowMs,
   stopIdentifier: '2023'
@@ -354,6 +381,11 @@ function makeResponse() {
         ok: true,
         json: async () => ({
           feedTimestamp: Math.floor(Date.now() / 1000),
+          realtimeCount: 1,
+          scheduledCount: 2,
+          scheduledCandidateCount: 4,
+          scheduledMergedCount: 3,
+          scheduleGeneratedAt: '2026-11-13',
           arrivals: [{
             id: 'live-trip-22',
             tripId: 'live-trip-22',
@@ -379,6 +411,10 @@ function makeResponse() {
     assert.equal(res.body.routes.length, 1);
     assert.equal(res.body.routes[0].times[0].source, 'realtime');
     assert.equal(res.body.routes[0].times[0].scheduled, false);
+    assert.equal(res.body.scheduled_count, 2);
+    assert.equal(res.body.scheduled_candidate_count, 4);
+    assert.equal(res.body.scheduled_merged_count, 3);
+    assert.equal(res.body.schedule_generated_at, '2026-11-13');
 
     // Metro stations are served from the local official timetable; they do not
     // make an RT request to Render.
