@@ -137,24 +137,36 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
 
     const terminal = tripId ? destinationLookup[tripId] : null;
     const terminalStopId = normalizeText(terminal?.terminal_stop_id);
-    const destinationCandidates = [
-      terminal?.destination,
+    const realtimeDestinationCandidates = [
       arrival.headsign,
       arrival.destination,
       arrival.stopHeadsign
     ].map(normalizeText).filter(Boolean);
-    // Trip-specific terminal IDs cover scheduled and short-turn trips. Check
-    // every available name as well: a partial-course headsign can identify its
-    // actual short-turn terminal even when the static trip mapping names the
-    // full route's usual endpoint.
-    const destinationIsBoardStop = Boolean(
-      terminalStopId && stopAliases.has(terminalStopId)
-    ) || destinationCandidates.some(candidate =>
-      destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
-    );
-    const candidateDestination = destinationCandidates[0] || '';
-    const destination = destinationIsBoardStop ? '' : candidateDestination;
+    const destinationCandidates = [
+      terminal?.destination,
+      ...realtimeDestinationCandidates
+    ].map(normalizeText).filter(Boolean);
 
+    // The RT headsign describes the actual instance of a trip and must take
+    // precedence over a static full-route terminal for short-turn/partial
+    // courses. Use the per-trip GTFS terminal only when RT gives no destination.
+    const destinationIsBoardStop = realtimeDestinationCandidates.length
+      ? realtimeDestinationCandidates.some(candidate =>
+          destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
+        )
+      : Boolean(
+          (terminalStopId && stopAliases.has(terminalStopId))
+          || destinationMatchesBoardStop(terminal?.destination, '', stopAliases, stopNames)
+        );
+
+    // A course that terminates at the stop currently shown on the board is
+    // not an arrival at that stop. Drop the complete course entry here so its
+    // line, destination, countdown and later arrival times are all omitted.
+    // This is trip-specific, so another trip on the same route can still be
+    // shown when it continues beyond the open stop.
+    if (destinationIsBoardStop) continue;
+
+    const destination = destinationCandidates[0] || '';
     const groupKey = `${routeId}|${destination}`;
     if (!groups.has(groupKey)) {
       groups.set(groupKey, {

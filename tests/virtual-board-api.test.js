@@ -70,7 +70,7 @@ const destinationArrival = {
   routeId: 'TM22',
   routeShortName: '22',
   routeType: '0',
-  headsign: 'OLD GTFS HEADSIGN',
+  headsign: 'Автостанция Изток',
   arrivalDate,
   isRealtime: true
 };
@@ -83,7 +83,7 @@ const hiddenTerminal = handler.mapRealtimeArrivalsToBoard([destinationArrival], 
   nowMs,
   stopIdentifier: '2023'
 });
-assert.equal(hiddenTerminal[0].destination, '', 'do not repeat the board stop as the trip destination');
+assert.deepEqual(hiddenTerminal, [], 'a course ending at the open board stop is omitted completely, including all arrival times');
 
 // Short-turn / partial courses use their own per-trip terminal mapping. When
 // that terminal is the station currently open, the direction must be hidden.
@@ -92,7 +92,7 @@ const partialCourse = handler.mapRealtimeArrivalsToBoard([{
   ...destinationArrival,
   id: 'partial-course-terminal-test',
   tripId: partialTripId,
-  headsign: 'OLD GTFS HEADSIGN'
+  headsign: ''
 }], {
   nowMs,
   stopIdentifier: '0470',
@@ -103,7 +103,7 @@ const partialCourse = handler.mapRealtimeArrivalsToBoard([{
     }
   }
 });
-assert.equal(partialCourse[0].destination, '', 'partial courses hide their own actual terminal when it is the open board stop');
+assert.deepEqual(partialCourse, [], 'a partial course ending at the open board stop is omitted completely');
 
 const partialHeadSignOverridesFullRoute = handler.mapRealtimeArrivalsToBoard([{
   ...destinationArrival,
@@ -120,7 +120,25 @@ const partialHeadSignOverridesFullRoute = handler.mapRealtimeArrivalsToBoard([{
     }
   }
 });
-assert.equal(partialHeadSignOverridesFullRoute[0].destination, '', 'an RT partial-course headsign can override a static full-route destination for terminal hiding');
+assert.deepEqual(partialHeadSignOverridesFullRoute, [], 'an RT partial-course headsign can identify and completely omit a short-turn at the open board stop');
+
+const partialHeadSignOverridesStaticTerminalAtFullEndpoint = handler.mapRealtimeArrivalsToBoard([{
+  ...destinationArrival,
+  id: 'partial-course-continues-past-static-terminal',
+  tripId: 'partial-course-with-static-full-route-map',
+  headsign: 'ГАРА ПОДУЯНЕ'
+}], {
+  nowMs,
+  stopIdentifier: '2023',
+  tripDestinations: {
+    'partial-course-with-static-full-route-map': {
+      terminal_stop_id: '2023',
+      destination: 'Автостанция Изток'
+    }
+  }
+});
+assert.equal(partialHeadSignOverridesStaticTerminalAtFullEndpoint.length, 1,
+  'an RT partial-course headsign overrides the static full-route terminal when deciding whether the open stop is the actual endpoint');
 
 // A partial course may be absent from the per-trip destination table. In that
 // case an RT headsign matching the current stop name still identifies it.
@@ -133,7 +151,27 @@ const partialHeadsignCourse = handler.mapRealtimeArrivalsToBoard([{
   nowMs,
   stopIdentifier: '0470'
 });
-assert.equal(partialHeadsignCourse[0].destination, '', 'partial-course headsign matching the OSM/GTFS stop name hides the direction');
+assert.deepEqual(partialHeadsignCourse, [], 'a partial-course headsign matching the OSM/GTFS stop name omits the complete arrival');
+
+// Filtering is per trip, not per route: a terminal trip is omitted while a
+// different trip on the same line can remain visible if it continues beyond
+// this board stop.
+const mixedTerminalAndThroughTrips = handler.mapRealtimeArrivalsToBoard([
+  destinationArrival,
+  {
+    ...destinationArrival,
+    id: 'same-line-through-trip',
+    tripId: 'same-line-through-trip',
+    headsign: 'Депо Искър'
+  }
+], {
+  nowMs,
+  stopIdentifier: '2023'
+});
+assert.equal(mixedTerminalAndThroughTrips.length, 1);
+assert.equal(mixedTerminalAndThroughTrips[0].times.length, 1);
+assert.equal(mixedTerminalAndThroughTrips[0].times[0].trip_id, 'same-line-through-trip',
+  'only the trip that terminates at the board stop is omitted; a through trip on the same line remains');
 
 const metroRealtime = handler.mapRealtimeArrivalsToBoard([{
   id: 'metro-rt-test',

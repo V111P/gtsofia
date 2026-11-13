@@ -1246,11 +1246,6 @@ VIRTUAL BOARDS
   padding-left: 99px;
 }
 
-.vb-time-block--no-direction {
-  margin-top: 0;
-  padding-left: 0;
-}
-
 .vb-arrival-main {
   display: inline-flex;
   align-items: center;

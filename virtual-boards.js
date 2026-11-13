@@ -570,7 +570,10 @@
           source: isMetro ? 'schedule' : 'realtime'
         }))
       };
-    }).filter(route => route.times.length));
+    }).filter(route =>
+      route.times.length
+      && Boolean(String(route.destination || route.headsign || '').trim())
+    ));
 
     if (!rows.length) {
       const emptyMessage = data?.board_mode === 'metro-schedule'
@@ -629,21 +632,16 @@
               )
               .join("");
 
-          const direction = String(row.destination || row.headsign || '').trim();
-          const directionRow = direction
-            ? `<div class="schedule-summary-route-row vb-route-row">`
-              + `${lineIdentityHtml(meta)}`
-              + `${destinationHtml(direction)}`
-              + `</div>`
-            : '';
-          const timeBlockClass = direction
-            ? 'vb-time-block'
-            : 'vb-time-block vb-time-block--no-direction';
+          const direction = String(row.destination || row.headsign).trim();
+          const directionRow = `<div class="schedule-summary-route-row vb-route-row">`
+            + `${lineIdentityHtml(meta)}`
+            + `${destinationHtml(direction)}`
+            + `</div>`;
 
           return `
             <article class="vb-row">
               ${directionRow}
-              <div class="${timeBlockClass}">
+              <div class="vb-time-block">
                 ${countdownHtml(
                   arrivals[0],
                   !arrivals[0]?.scheduled,

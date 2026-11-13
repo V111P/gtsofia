@@ -116,10 +116,11 @@ renderBoardList(panel, {
     times: [{ timestamp: now + 300, source: 'realtime', realtime: true, scheduled: false }]
   }]
 });
-assert.doesNotMatch(panelElements['.virtual-board-list'].innerHTML, /vb-route-row|schedule-line-pill|vb-destination/,
-  'the entire route-and-direction row is omitted when the trip terminates at the open stop');
-assert.match(panelElements['.virtual-board-list'].innerHTML, /vb-time-block vb-time-block--no-direction/,
-  'arrival times remain visible and align without the hidden direction row');
+assert.equal(panelElements['.virtual-board-list'].innerHTML,
+  '<div class="virtual-board-no-data">Няма налични realtime пристигания.</div>',
+  'a route without a destination is omitted in full, including line identity and all arrival times');
+assert.doesNotMatch(source, /vb-time-block--no-direction/,
+  'the renderer no longer has a time-only layout for terminal courses');
 
 renderBoardList(panel, {
   status: 'ok',
