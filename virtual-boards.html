@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Виртуални табла | GTSofia</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sofia+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+  <header class="navbar">
+    <a href="index.html" class="nav-logo">GTSOFIA</a>
+    <button class="nav-toggle" onclick="toggleMenu()" aria-label="Отвори меню">☰</button>
+    <nav id="navMenu">
+      <a href="index.html">Начало</a>
+      <a href="schedules.html">Разписания</a>
+      <a href="virtual-boards.html" class="active">Виртуални табла</a>
+      <a href="rolling-stock.html">Подвижен състав</a>
+      <a href="about.html">За проекта</a>
+    </nav>
+  </header>
+
+  <main class="virtual-boards">
+
+    <section class="virtual-board-layout">
+      <div class="virtual-map-card">
+        <div id="virtualMap" class="virtual-map" aria-label="Карта на спирките в София"></div>
+      </div>
+
+      <aside class="virtual-board-panel" id="virtualBoardPanel">
+        <div id="virtualBoardContent" class="virtual-board-content">
+          <div class="virtual-board-controls">
+            <div class="virtual-stop-search virtual-stop-search-panel">
+              <label class="sr-only" for="stopSearch">Търсене по спирка</label>
+              <input
+                id="stopSearch"
+                type="search"
+                placeholder="Търсене по спирка…"
+                autocomplete="off"
+                aria-label="Търсене по спирка"
+              />
+              <div id="stopSearchResults" class="virtual-stop-search-results" hidden></div>
+            </div>
+            <button
+              type="button"
+              id="locateUserButton"
+              class="map-tool-button map-location-button"
+              aria-label="Моята локация"
+              title="Моята локация"
+            >
+              <img src="Icons/location.svg" alt="" aria-hidden="true" />
+            </button>
+          </div>
+          <div id="virtualBoardBody" class="virtual-board-body"></div>
+        </div>
+      </aside>
+    </section>
+  </main>
+
+  <script src="navbar.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="stop-utils.js"></script>
+  <script src="virtual-boards.js?v=31"></script>
+</body>
+</html>
