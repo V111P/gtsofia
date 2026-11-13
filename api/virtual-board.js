@@ -2,7 +2,11 @@ const { buildVirtualBoard } = require('./virtual-board-service');
 const tripsData = require('../data/trips.json');
 const stopsData = require('../data/stops.json');
 
-const FEED_URL = 'https://gtfs.sofiatraffic.bg/api/v1/trip-updates';
+// Trinmo is used only as the realtime TripUpdates source. Static GTFS data
+// remains the daily snapshot generated from the official Sofia Traffic API.
+// Keep the URL configurable so the provider can be changed without editing code.
+const FEED_URL = process.env.GTSOFIA_TRIP_UPDATES_URL
+  || 'https://trinmo.org/gtfs-data/trip-updates';
 const FEED_TIMEOUT_MS = 15000;
 const MAX_FEED_AGE_SECONDS = 120;
 const MAX_FEED_FUTURE_SKEW_SECONDS = 60;
@@ -549,9 +553,195 @@ function decodeFeedEntity(bytes) {
   return entity;
 }
 
+function getFirstDefined(object, keys) {
+  for (const key of keys) {
+    if (object?.[key] !== undefined && object?.[key] !== null) {
+      return object[key];
+    }
+  }
+  return undefined;
+}
+
+function parseSafeInteger(value, fieldName) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw new Error(`GTFS-RT JSON has an invalid ${fieldName}.`);
+  }
+  return number;
+}
+
+function parseRealtimeEnum(value, enumValues, defaultValue, fieldName) {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+
+  if (typeof value === 'number' || /^-?\d+$/.test(String(value).trim())) {
+    const number = Number(value);
+    if (Number.isSafeInteger(number)) return number;
+  }
+
+  const name = String(value).trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (Object.prototype.hasOwnProperty.call(enumValues, name)) {
+    return enumValues[name];
+  }
+
+  throw new Error(`GTFS-RT JSON has an unknown ${fieldName}: ${String(value)}.`);
+}
+
+function normalizeJsonStopTimeEvent(event) {
+  if (!event || typeof event !== 'object') return null;
+
+  return {
+    delay: parseSafeInteger(event.delay, 'StopTimeEvent.delay'),
+    time: parseSafeInteger(event.time, 'StopTimeEvent.time'),
+    scheduledTime: parseSafeInteger(
+      getFirstDefined(event, ['scheduledTime', 'scheduled_time']),
+      'StopTimeEvent.scheduled_time'
+    ),
+    uncertainty: parseSafeInteger(event.uncertainty, 'StopTimeEvent.uncertainty')
+  };
+}
+
+function normalizeJsonTripDescriptor(trip) {
+  if (!trip || typeof trip !== 'object') return null;
+
+  return {
+    tripId: String(getFirstDefined(trip, ['tripId', 'trip_id']) ?? '').trim(),
+    routeId: String(getFirstDefined(trip, ['routeId', 'route_id']) ?? '').trim(),
+    directionId: String(getFirstDefined(trip, ['directionId', 'direction_id']) ?? '').trim(),
+    startTime: String(getFirstDefined(trip, ['startTime', 'start_time']) ?? '').trim(),
+    startDate: String(getFirstDefined(trip, ['startDate', 'start_date']) ?? '').trim(),
+    scheduleRelationship: parseRealtimeEnum(
+      getFirstDefined(trip, ['scheduleRelationship', 'schedule_relationship']),
+      TRIP_RELATIONSHIP,
+      TRIP_RELATIONSHIP.SCHEDULED,
+      'TripDescriptor.schedule_relationship'
+    )
+  };
+}
+
+function normalizeJsonTripProperties(properties) {
+  if (!properties || typeof properties !== 'object') return null;
+
+  return {
+    tripId: String(getFirstDefined(properties, ['tripId', 'trip_id']) ?? '').trim(),
+    startDate: String(getFirstDefined(properties, ['startDate', 'start_date']) ?? '').trim(),
+    startTime: String(getFirstDefined(properties, ['startTime', 'start_time']) ?? '').trim()
+  };
+}
+
+function normalizeJsonStopTimeUpdate(update) {
+  return {
+    stopSequence: parseSafeInteger(
+      getFirstDefined(update, ['stopSequence', 'stop_sequence']),
+      'StopTimeUpdate.stop_sequence'
+    ),
+    stopId: String(getFirstDefined(update, ['stopId', 'stop_id']) ?? '').trim(),
+    arrival: normalizeJsonStopTimeEvent(update?.arrival),
+    departure: normalizeJsonStopTimeEvent(update?.departure),
+    scheduleRelationship: parseRealtimeEnum(
+      getFirstDefined(update, ['scheduleRelationship', 'schedule_relationship']),
+      STOP_RELATIONSHIP,
+      STOP_RELATIONSHIP.SCHEDULED,
+      'StopTimeUpdate.schedule_relationship'
+    )
+  };
+}
+
+function decodeGtfsRealtimeJsonFeed(bytes) {
+  let parsed;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(bytes).replace(/^\uFEFF/, '').trim());
+  } catch {
+    throw new Error('Trinmo TripUpdates response is not valid JSON.');
+  }
+
+  // Accept the standard GTFS-Realtime ProtoJSON envelope, including common
+  // snake_case aliases and a simple { data: FeedMessage } wrapper.
+  let feed = parsed;
+  if (feed?.data && !feed?.header && !feed?.feedHeader) {
+    feed = feed.data;
+  }
+  if (feed?.feedMessage && !feed?.header && !feed?.feedHeader) {
+    feed = feed.feedMessage;
+  }
+
+  const header = getFirstDefined(feed, ['header', 'feedHeader', 'feed_header']);
+  const entities = getFirstDefined(feed, ['entity', 'entities', 'feedEntity', 'feed_entity']);
+  if (!header || !Array.isArray(entities)) {
+    throw new Error('Trinmo TripUpdates JSON does not contain a GTFS-Realtime header and entity array.');
+  }
+
+  const incrementalityRaw = getFirstDefined(header, ['incrementality']);
+  const feedIncrementality = incrementalityRaw === 'DIFFERENTIAL'
+    ? 1
+    : incrementalityRaw === 'FULL_DATASET'
+      ? 0
+      : parseSafeInteger(incrementalityRaw, 'FeedHeader.incrementality') ?? 0;
+
+  if (feedIncrementality !== 0) {
+    throw new Error('GTFS-RT differential feeds are not supported by this stateless API.');
+  }
+
+  const feedTimestamp = parseSafeInteger(header.timestamp, 'FeedHeader.timestamp');
+  const updates = [];
+
+  for (const entity of entities) {
+    if (entity?.isDeleted === true || entity?.is_deleted === true) continue;
+
+    const rawUpdate = getFirstDefined(entity, ['tripUpdate', 'trip_update']);
+    if (!rawUpdate || typeof rawUpdate !== 'object') continue;
+
+    const rawTrip = getFirstDefined(rawUpdate, ['trip', 'tripDescriptor', 'trip_descriptor'])
+      || (getFirstDefined(rawUpdate, ['tripId', 'trip_id']) !== undefined ? rawUpdate : null);
+    const rawStopUpdates = getFirstDefined(rawUpdate, [
+      'stopTimeUpdate', 'stop_time_update', 'stopTimeUpdates', 'stop_time_updates'
+    ]) || [];
+
+    if (!Array.isArray(rawStopUpdates)) {
+      throw new Error('GTFS-RT JSON has an invalid TripUpdate.stop_time_update array.');
+    }
+
+    const normalizedUpdate = {
+      trip: normalizeJsonTripDescriptor(rawTrip),
+      stopTimeUpdates: rawStopUpdates.map(normalizeJsonStopTimeUpdate),
+      timestamp: parseSafeInteger(rawUpdate.timestamp, 'TripUpdate.timestamp'),
+      delay: parseSafeInteger(rawUpdate.delay, 'TripUpdate.delay'),
+      tripProperties: normalizeJsonTripProperties(
+        getFirstDefined(rawUpdate, ['tripProperties', 'trip_properties'])
+      )
+    };
+
+    if (normalizedUpdate.trip || normalizedUpdate.tripProperties) {
+      updates.push(normalizedUpdate);
+    }
+  }
+
+  return { updates, feedTimestamp };
+}
+
 function decodeGtfsRealtimeFeed(buffer) {
-  const bytes =
-    new Uint8Array(buffer);
+  const bytes = new Uint8Array(buffer);
+  let firstContentByte = 0;
+  while (
+    firstContentByte < bytes.length
+    && (bytes[firstContentByte] === 0x20
+      || bytes[firstContentByte] === 0x09
+      || bytes[firstContentByte] === 0x0a
+      || bytes[firstContentByte] === 0x0d)
+  ) {
+    firstContentByte += 1;
+  }
+
+  // Accept JSON-encoded GTFS-Realtime when provided, while retaining the
+  // protobuf path for the original binary GTFS-Realtime representation.
+  if (bytes[firstContentByte] === 0x7b || bytes[firstContentByte] === 0x5b) {
+    return decodeGtfsRealtimeJsonFeed(bytes);
+  }
 
   const state = { index: 0 };
 
@@ -1210,7 +1400,7 @@ async function fetchRealtimeFeed() {
             controller.signal,
           headers: {
             Accept:
-              'application/x-protobuf, application/octet-stream',
+              'application/json, application/x-protobuf, application/octet-stream',
             'User-Agent':
               'GTSofia virtual boards'
           },
@@ -1220,7 +1410,7 @@ async function fetchRealtimeFeed() {
 
     if (!upstream.ok) {
       throw new Error(
-        `Sofia Traffic GTFS-RT returned ${upstream.status}.`
+        `Trinmo GTFS-RT returned ${upstream.status}.`
       );
     }
 
@@ -1231,7 +1421,7 @@ async function fetchRealtimeFeed() {
       !body.byteLength
     ) {
       throw new Error(
-        'Sofia Traffic GTFS-RT feed is empty.'
+        'Trinmo GTFS-RT feed is empty.'
       );
     }
 
@@ -1350,8 +1540,8 @@ module.exports =
         realtimeStatus = 'unavailable';
         realtimeMessage = 'Realtime информацията временно не е налична — показваме разписанието.';
         const detail = error?.name === 'AbortError'
-          ? 'Sofia Traffic GTFS-RT request timed out.'
-          : (error?.message || 'Unable to fetch/decode GTFS-RT.');
+          ? 'Trinmo GTFS-RT request timed out.'
+          : (error?.message || 'Unable to fetch/decode Trinmo GTFS-RT.');
         console.warn(`GTSofia realtime fallback for stop ${stopCode}: ${detail}`);
       }
     }
