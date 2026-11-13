@@ -1188,4 +1188,36 @@ assert.ok(
   'bus 190 must show a realtime prediction at stop 1411 from a time-only update at the origin'
 );
 
+
+// Regression: NO_DATA at 1247 interrupts propagation from 0633. Keep the
+// timetable arrival at 1247 while accepting the resumed prediction at 0470.
+let tm22NoDataTrip = {
+  ...tm22RealtimeTrip,
+  stop_time_updates: [
+    { stop_sequence: tm22Course.stop_sequences[tm22Indexes[0]], arrival: { timestamp: Date.parse('2026-11-11T05:06:30+02:00') / 1000 } },
+    { stop_sequence: tm22Course.stop_sequences[tm22Indexes[1]], schedule_relationship: 2 },
+    { stop_sequence: tm22Course.stop_sequences[tm22Indexes[2]], arrival: { timestamp: tm22UpdateAt0470 } },
+    { stop_sequence: tm22Course.stop_sequences[tm22Indexes[3]], arrival: { timestamp: tm22UpdateAt2023 } }
+  ]
+};
+const tm22BoardAt1247NoData = actual.buildBoard({
+  routes: [], skipped_trips: [], realtime_trips: [tm22NoDataTrip]
+}, '1247', new Date('2026-11-11T05:15:00+02:00'));
+const tm22NoDataFallback = tm22BoardAt1247NoData.routes
+  .filter(route => route.route_id === 'TM22')
+  .flatMap(route => route.times);
+const tm22Index1247 = tm22Pattern.indexOf('1247');
+assert.ok(tm22Index1247 >= 0, 'tram 22 D2 must include stop 1247');
+tm22NoDataTrip = { ...tm22NoDataTrip, stop_time_updates: [
+  { stop_sequence: tm22Course.stop_sequences[tm22Indexes[0]], arrival: { timestamp: Date.parse('2026-11-11T05:06:30+02:00') / 1000 } },
+  { stop_sequence: tm22Course.stop_sequences[tm22Index1247], schedule_relationship: 2 },
+  { stop_sequence: tm22Course.stop_sequences[tm22Indexes[2]], arrival: { timestamp: tm22UpdateAt0470 } },
+  { stop_sequence: tm22Course.stop_sequences[tm22Indexes[3]], arrival: { timestamp: tm22UpdateAt2023 } }
+] };
+const tm22ScheduledAt1247 = Date.parse(`2026-11-11T${tm22Course.times[tm22Index1247]}+02:00`) / 1000;
+assert.ok(
+  tm22NoDataFallback.some(time => time.scheduled && Math.round(time.timestamp) === Math.round(tm22ScheduledAt1247)),
+  'tram 22 at 1247 must retain its scheduled arrival when NO_DATA interrupts realtime coverage'
+);
+
 console.log('virtual-board-service: all tests passed');
