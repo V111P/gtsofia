@@ -7,7 +7,10 @@ SCRIPTS = ROOT / "Scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from transport_data.output import build_metro_board_data, build_trip_destinations
+from transport_data.output import (
+    build_metro_board_data, build_trip_destinations,
+    build_virtual_board_schedule_data,
+)
 
 
 class VirtualBoardOutputTests(unittest.TestCase):
@@ -136,6 +139,63 @@ class VirtualBoardOutputTests(unittest.TestCase):
         self.assertEqual(result["calendar"]["dateTypes"]["2026-12-24"], "weekday", "explicit future overrides take priority")
         self.assertEqual(result["calendar"]["dateTypes"]["2026-12-25"], "weekend", "active GTFS service IDs identify holiday/weekend service")
         self.assertEqual(result["calendar"]["dateTypes"]["2026-12-26"], "weekend", "ties use the calendar date's normal weekday/weekend classification")
+
+    def test_proxy_schedule_index_is_surface_only_and_uses_exact_service_dates(self):
+        schedules = {
+            "TM22": {
+                "D1": {
+                    "weekday": [{
+                        "original_trip_id": "tram-trip",
+                        "service_id": "weekday-service",
+                        "times": ["05:00:00", "05:10:00"],
+                    }],
+                    "weekend": [{
+                        "original_trip_id": "tram-trip",
+                        "service_id": "weekday-service",
+                        "times": ["05:00:00", "05:10:00"],
+                    }],
+                }
+            },
+            "M1": {
+                "D1": {
+                    "weekday": [{
+                        "original_trip_id": "metro-trip",
+                        "service_id": "metro-service",
+                        "times": ["05:00:00", "05:30:00"],
+                    }]
+                }
+            },
+        }
+        calendar = {
+            "referenceDate": "2026-11-13",
+            "serviceCoverageEndDate": "2026-11-15",
+            "serviceIdsByDate": {
+                "2026-11-13": ["weekday-service"],
+                "2026-11-14": [],
+                "2026-11-15": ["weekday-service"],
+            },
+        }
+        result = build_virtual_board_schedule_data(
+            self.routes,
+            [
+                {"stop_id": "0633", "stop_code": "0633"},
+                {"stop_id": "2023", "stop_code": "2023"},
+            ],
+            self.directions,
+            schedules,
+            calendar,
+        )
+
+        self.assertEqual(set(result["routes"]), {"TM22"})
+        self.assertEqual(result["stopIdsByIdentifier"]["0633"], ["0633"])
+        self.assertEqual(result["calendar"]["coverageDays"], 3)
+        bits = int(result["calendar"]["serviceBits"]["weekday-service"], 16)
+        self.assertEqual(bits & 0b111, 0b101)
+        direction = result["routes"]["TM22"]["directions"]["D1"]
+        self.assertEqual(direction["terminalStopId"], "2023")
+        self.assertEqual(direction["destination"], "Автостанция Изток")
+        self.assertEqual(direction["courses"][0]["tripId"], "tram-trip")
+        self.assertNotIn("metro-trip", str(result))
 
 
 if __name__ == "__main__":

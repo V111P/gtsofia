@@ -1,6 +1,7 @@
 import express from 'express';
 import { getArrivalsByIdentifier } from './lib/arrivals.js';
 import { getStops, getTripLookup } from './lib/gtfs-static.js';
+import { getScheduleData } from './lib/schedule-data.js';
 
 const app = express();
 const port = Number(process.env.PORT || 10000);
@@ -33,13 +34,18 @@ app.get('/api/stops/:identifier/arrivals', async (req, res) => {
   try {
     const result = await getArrivalsByIdentifier(stopIdentifier, { limit });
     return res.json({
-      provider: 'Sofia Traffic GTFS-RT',
+      provider: 'Sofia Traffic GTFS-RT + GTFS schedule',
       stopIdentifier,
       generatedAt: new Date().toISOString(),
       feedTimestamp: result.feedTimestamp,
       feedAgeSeconds: result.feedTimestamp == null
         ? null
         : Math.max(0, Math.floor(Date.now() / 1000) - result.feedTimestamp),
+      realtimeAvailable: result.realtimeAvailable,
+      realtimeError: result.realtimeError || null,
+      realtimeCount: result.realtimeCount,
+      scheduledCount: result.scheduledCount,
+      scheduleGeneratedAt: result.scheduleGeneratedAt,
       arrivals: result.arrivals,
       count: result.count
     });
@@ -56,7 +62,9 @@ app.use((_req, res) => res.status(404).json({ error: 'Not found.' }));
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`GT Sofia realtime proxy listening on port ${port}`);
-  Promise.all([getStops(), getTripLookup()])
-    .then(() => console.log('GTFS static stop and trip lookups warmed.'))
-    .catch(error => console.error('GTFS static warmup failed; the first request will retry:', error?.message || error));
+  Promise.all([getStops(), getTripLookup(), getScheduleData()])
+    .then(([, , scheduleData]) => console.log(
+      `GTFS lookups and ${Object.keys(scheduleData.routes || {}).length} surface timetable routes warmed.`
+    ))
+    .catch(error => console.error('GTFS warmup failed; the first request will retry:', error?.message || error));
 });

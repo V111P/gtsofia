@@ -2,7 +2,7 @@
   "name": "gtsofia-realtime-proxy",
   "version": "1.0.0",
   "private": true,
-  "description": "Realtime-only JSON proxy for GT Sofia virtual boards, based on Sofia Public Transport API.",
+  "description": "Realtime-first JSON proxy with static GTFS timetable fallback for GT Sofia virtual boards.",
   "type": "module",
   "scripts": {
     "start": "node server.js"

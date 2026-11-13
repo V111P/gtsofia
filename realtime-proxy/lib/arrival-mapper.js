@@ -1,4 +1,4 @@
-/** Pure GTFS-RT TripUpdate to stop-arrival mapper. No static timetable fallback. */
+/** Pure mapper for explicit GTFS-RT TripUpdate events; schedule fallback is merged separately. */
 const MAX_ARRIVALS_PER_REQUEST = 100;
 const PAST_GRACE_MS = 60_000;
 
@@ -27,7 +27,7 @@ export function extractRealtimeArrivals(entities, stopIds, options = {}) {
 
   for (const entity of Array.isArray(entities) ? entities : []) {
     // Explicitly exclude canceled and deleted trips.
-    if (entity.tripScheduleRelationship === 3 || entity.tripScheduleRelationship === 7) continue;
+    if ([3, 6, 7].includes(Number(entity.tripScheduleRelationship))) continue;
 
     const tripInfo = tripLookup[entity.tripId] || {
       tripId: entity.tripId,

@@ -98,6 +98,24 @@ function getRouteForArrival(arrival) {
   };
 }
 
+function resolveOsmDestinationName(value, stops = stopsData) {
+  const normalized = normalizeStopName(value);
+  if (!normalized) return '';
+  const fields = [
+    'osm_full_name_bg', 'osm_stop_name', 'osm_name', 'stop_name',
+    'gtfs_stop_name', 'name'
+  ];
+  for (const stop of Array.isArray(stops) ? stops : []) {
+    const matches = fields.some(field => normalizeStopName(stop?.[field]) === normalized);
+    if (!matches) continue;
+    for (const field of ['osm_full_name_bg', 'osm_stop_name', 'osm_name', 'name', 'stop_name', 'gtfs_stop_name']) {
+      const candidate = normalizeText(stop?.[field]);
+      if (candidate) return candidate;
+    }
+  }
+  return normalizeText(value);
+}
+
 function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
   const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
   const stops = Array.isArray(options.stops) ? options.stops : stopsData;
@@ -112,7 +130,11 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
   const seen = new Set();
 
   for (const arrival of Array.isArray(arrivals) ? arrivals : []) {
-    if (!arrival || !(arrival.isRealtime === true || arrival.is_realtime === true)) continue;
+    if (!arrival) continue;
+    const isRealtime = arrival.isRealtime === true || arrival.is_realtime === true || arrival.source === 'realtime';
+    const isScheduled = arrival.isScheduled === true || arrival.is_scheduled === true
+      || arrival.scheduled === true || arrival.source === 'schedule';
+    if (!isRealtime && !isScheduled) continue;
 
     const dateValue = arrival.arrivalDate || arrival.arrival_date || arrival.estimatedTime;
     const timestampMs = Date.parse(dateValue || '');
@@ -122,7 +144,7 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
 
     const route = getRouteForArrival(arrival);
     const meta = getRouteMetadata(route);
-    // Metro is displayed from its official timetable, not from the RT feed.
+    // Metro remains on its separate official local timetable path.
     if (meta?.type === 'metro') continue;
 
     const routeId = normalizeText(route.route_id);
@@ -131,42 +153,41 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     if (!routeId || !routeNumber) continue;
 
     const arrivalId = normalizeText(arrival.id)
-      || `${tripId}|${routeId}|${timestampMs}`;
+      || `${tripId}|${routeId}|${timestampMs}|${isRealtime ? 'rt' : 'schedule'}`;
     if (seen.has(arrivalId)) continue;
     seen.add(arrivalId);
 
     const terminal = tripId ? destinationLookup[tripId] : null;
-    const terminalStopId = normalizeText(terminal?.terminal_stop_id);
-    const realtimeDestinationCandidates = [
-      arrival.headsign,
-      arrival.destination,
-      arrival.stopHeadsign
-    ].map(normalizeText).filter(Boolean);
-    const destinationCandidates = [
-      terminal?.destination,
-      ...realtimeDestinationCandidates
-    ].map(normalizeText).filter(Boolean);
+    const terminalStopId = normalizeText(arrival.terminalStopId || arrival.terminal_stop_id || terminal?.terminal_stop_id);
+    const realtimeDestinationCandidates = isRealtime
+      ? [arrival.headsign, arrival.destination, arrival.stopHeadsign].map(normalizeText).filter(Boolean)
+      : [];
+    const realtimeDestinationMatches = realtimeDestinationCandidates.some(candidate =>
+      destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
+    );
+    const staticTerminalMatches = Boolean(
+      (terminalStopId && stopAliases.has(terminalStopId))
+      || destinationMatchesBoardStop(terminal?.destination || arrival.destination, '', stopAliases, stopNames)
+    );
 
-    // The RT headsign describes the actual instance of a trip and must take
-    // precedence over a static full-route terminal for short-turn/partial
-    // courses. Use the per-trip GTFS terminal only when RT gives no destination.
+    // A realtime headsign describes this particular trip instance and takes
+    // precedence over the full-route static destination. Scheduled fallback
+    // rows use their own generated partial/full trip terminal.
     const destinationIsBoardStop = realtimeDestinationCandidates.length
-      ? realtimeDestinationCandidates.some(candidate =>
-          destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
-        )
-      : Boolean(
-          (terminalStopId && stopAliases.has(terminalStopId))
-          || destinationMatchesBoardStop(terminal?.destination, '', stopAliases, stopNames)
-        );
+      ? realtimeDestinationMatches
+      : staticTerminalMatches;
 
-    // A course that terminates at the stop currently shown on the board is
-    // not an arrival at that stop. Drop the complete course entry here so its
-    // line, destination, countdown and later arrival times are all omitted.
-    // This is trip-specific, so another trip on the same route can still be
-    // shown when it continues beyond the open stop.
+    // A course ending at the board stop is not an arrival there: remove the
+    // complete course (line, destination and all its times) for both sources.
     if (destinationIsBoardStop) continue;
 
-    const destination = destinationCandidates[0] || '';
+    const realtimeDestination = realtimeDestinationCandidates.length
+      ? resolveOsmDestinationName(realtimeDestinationCandidates[0], stops)
+      : '';
+    const destination = realtimeDestination
+      || normalizeText(terminal?.destination)
+      || normalizeText(arrival.destination)
+      || normalizeText(arrival.headsign);
     const groupKey = `${routeId}|${destination}`;
     if (!groups.has(groupKey)) {
       groups.set(groupKey, {
@@ -175,7 +196,7 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
         destination,
         headsign: destination,
         meta,
-        realtime: true,
+        realtime: false,
         scheduled: false,
         times: []
       });
@@ -185,16 +206,20 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     const delay = rawDelay === null || rawDelay === undefined || rawDelay === ''
       ? null
       : Number(rawDelay);
+    const source = isRealtime ? 'realtime' : 'schedule';
 
-    groups.get(groupKey).times.push({
+    const group = groups.get(groupKey);
+    group.realtime ||= isRealtime;
+    group.scheduled ||= isScheduled;
+    group.times.push({
       timestamp: Math.floor(timestampMs / 1000),
       delay: Number.isFinite(delay) ? delay : null,
-      scheduled: false,
-      source: 'realtime',
-      realtime: true,
+      scheduled: isScheduled,
+      source,
+      realtime: isRealtime,
       route_id: routeId,
       trip_id: tripId,
-      realtime_trip_id: tripId,
+      realtime_trip_id: isRealtime ? tripId : '',
       arrival_id: arrivalId
     });
   }
@@ -202,8 +227,9 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
   return [...groups.values()]
     .map(route => ({
       ...route,
-      times: route.times
+      times: [...new Map(route.times
         .sort((left, right) => left.timestamp - right.timestamp)
+        .map(time => [time.arrival_id, time])).values()]
         .slice(0, MAX_ARRIVALS_PER_LINE)
     }))
     .filter(route => route.times.length > 0)
@@ -313,10 +339,15 @@ function buildMetroScheduleRoutes(stopIdentifier, options = {}) {
       route_text_color: route.route_text_color
     };
     const meta = getRouteMetadata(metaRoute);
-    const terminalStopId = normalizeText(direction.terminal_stop_id);
-    const destination = terminalStopId && aliases.has(terminalStopId)
-      ? ''
-      : normalizeText(direction.destination);
+    const stopIds = Array.isArray(direction.stop_ids) ? direction.stop_ids : [];
+    const terminalStopId = normalizeText(direction.terminal_stop_id || stopIds[stopIds.length - 1]);
+
+    // Same terminal rule for every source and mode: if this direction ends at
+    // the station currently open on the board, omit the entire arrival row and
+    // all of its static times. The opposite direction remains visible.
+    if (terminalStopId && aliases.has(terminalStopId)) continue;
+
+    const destination = normalizeText(direction.destination);
     const times = [];
 
     for (const serviceDate of serviceDates) {
@@ -446,7 +477,6 @@ async function handler(req, res) {
       refreshed_at: refreshedAt,
       realtime_status: 'not_applicable',
       provider: 'GT Sofia official GTFS timetable',
-      realtime_only: false,
       routes
     });
   }
@@ -458,26 +488,33 @@ async function handler(req, res) {
       stopIdentifier
     });
     const feedTimestamp = Number(proxyPayload.feedTimestamp);
+    const realtimeAvailable = proxyPayload.realtimeAvailable !== false;
+    const realtimeMessage = realtimeAvailable
+      ? ''
+      : 'RT информацията временно не е налична; показваме времената по разписание.';
 
     return res.status(200).json({
       status: routes.length ? 'ok' : 'empty',
-      board_mode: 'realtime',
+      board_mode: 'realtime-with-schedule-fallback',
       stop_code: stopIdentifier,
       stop_identifier: stopIdentifier,
       generated_at: Number.isFinite(feedTimestamp) && feedTimestamp > 0 ? feedTimestamp : null,
       refreshed_at: refreshedAt,
       realtime_feed_timestamp: Number.isFinite(feedTimestamp) && feedTimestamp > 0 ? feedTimestamp : null,
-      realtime_status: 'available',
-      realtime_message: '',
-      provider: 'Sofia Traffic GTFS-RT',
-      realtime_only: true,
+      realtime_status: realtimeAvailable ? 'available' : 'unavailable',
+      realtime_message: realtimeMessage,
+      realtime_count: Number(proxyPayload.realtimeCount) || routes.reduce((sum, route) =>
+        sum + route.times.filter(time => time.source === 'realtime').length, 0),
+      scheduled_count: Number(proxyPayload.scheduledCount) || routes.reduce((sum, route) =>
+        sum + route.times.filter(time => time.source === 'schedule').length, 0),
+      provider: 'Sofia Traffic GTFS-RT + GTFS timetable',
       routes
     });
   } catch (error) {
     const statusCode = Number(error?.statusCode) || 502;
     const message = statusCode === 503
       ? 'RT proxy не е конфигуриран. Добави SOFIA_REALTIME_PROXY_URL във Vercel.'
-      : 'Realtime услугата временно не е налична. Не показваме времена от разписанието.';
+      : 'Realtime услугата и резервното разписание временно не са налични.';
     console.warn(`GT Sofia realtime proxy error for stop ${stopIdentifier}:`, error?.message || error);
 
     return res.status(statusCode).json({
@@ -489,7 +526,6 @@ async function handler(req, res) {
       refreshed_at: refreshedAt,
       realtime_status: 'unavailable',
       realtime_message: message,
-      realtime_only: true,
       routes: [],
       error: message
     });
@@ -498,6 +534,7 @@ async function handler(req, res) {
 
 module.exports = handler;
 module.exports.mapRealtimeArrivalsToBoard = mapRealtimeArrivalsToBoard;
+module.exports.resolveOsmDestinationName = resolveOsmDestinationName;
 module.exports.buildMetroScheduleRoutes = buildMetroScheduleRoutes;
 module.exports.getStopAliases = getStopAliases;
 module.exports.fetchProxyArrivals = fetchProxyArrivals;

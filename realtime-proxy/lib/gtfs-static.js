@@ -1,7 +1,7 @@
 /**
- * Minimal static GTFS lookup adapted from tanislavivanov/sofia-transport-api (MIT).
- * Static data is used only to resolve GTFS stop IDs/public stop codes and route display metadata.
- * It is never used to invent arrival times.
+ * Minimal static GTFS metadata lookup adapted from tanislavivanov/sofia-transport-api (MIT).
+ * This module resolves GTFS stop IDs/public stop codes and RT route/trip display metadata.
+ * Scheduled arrival times are read from the separately generated compact timetable index.
  */
 import AdmZip from 'adm-zip';
 import { parseCSV } from './csv.js';
