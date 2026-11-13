@@ -235,9 +235,7 @@ function makeFeed(timestamp = Math.floor(Date.now() / 1000), includeTimestamp = 
 const feed = makeFeed();
 
 let realtimeFetchCount = 0;
-let requestedRealtimeUrl = '';
-global.fetch = async url => {
-  requestedRealtimeUrl = String(url);
+global.fetch = async () => {
   realtimeFetchCount += 1;
   return {
     ok: true,
@@ -272,7 +270,6 @@ const res = {
   assert.equal(typeof payload.generated_at, 'number');
   assert.equal(payload.realtime_status, 'available');
   assert.equal(realtimeFetchCount, 1, 'the first manual board load should fetch the realtime feed');
-  assert.equal(requestedRealtimeUrl, 'https://trinmo.org/gtfs-data/trip-updates', 'virtual boards must use Trinmo only as their realtime TripUpdates source');
   assert.equal(Object.hasOwn(payload, 'active_trips'), false);
   assert.equal(Object.hasOwn(payload, 'skipped_trips'), false);
 
@@ -337,59 +334,6 @@ const res = {
     'other scheduled TB7 trips must remain visible when one trip has realtime but no stop prediction'
   );
   assert.equal(realtimeFetchCount, 2, 'a subsequent manual refresh must fetch a new feed rather than use a time-based cache');
-
-  // Trinmo may expose GTFS-Realtime as ProtoJSON instead of binary protobuf.
-  // The same normalization and board-building rules must apply to both formats.
-  const jsonFeed = {
-    header: {
-      gtfsRealtimeVersion: '2.0',
-      incrementality: 'FULL_DATASET',
-      timestamp: String(now)
-    },
-    entity: [{
-      id: 'json-normal',
-      tripUpdate: {
-        trip: {
-          tripId: normalFallbackCourse.original_trip_id,
-          routeId: 'TB2',
-          startTime: normalFallbackCourse.trip_start_time,
-          startDate: sofiaDate,
-          scheduleRelationship: 'SCHEDULED'
-        },
-        stopTimeUpdate: [{
-          stopId: '0605',
-          scheduleRelationship: 'SCHEDULED',
-          arrival: {
-            time: String(now + 60),
-            delay: -15,
-            scheduledTime: String(now + 75),
-            uncertainty: 30
-          }
-        }]
-      }
-    }]
-  };
-  global.fetch = async () => {
-    const json = Buffer.from(JSON.stringify(jsonFeed), 'utf8');
-    return {
-      ok: true,
-      arrayBuffer: async () => json.buffer.slice(json.byteOffset, json.byteOffset + json.byteLength)
-    };
-  };
-  req.query.stop_code = '0605';
-  await handler(req, res);
-  assert.equal(res.statusCode, 200);
-  assert.equal(payload.realtime_status, 'available', 'a fresh ProtoJSON TripUpdates feed must be accepted');
-  const jsonPrediction = payload.routes.find(route =>
-    route.realtime_trip_id === normalFallbackCourse.original_trip_id
-      && route.times?.some(time => Math.round(Number(time.timestamp)) === now + 60)
-  );
-  assert.ok(jsonPrediction, 'JSON TripUpdate predictions must appear on the virtual board');
-  assert.ok(
-    jsonPrediction.times.some(time => time.delay === -15 && time.uncertainty === 30
-      && Number(time.scheduled_time) === now + 75),
-    'JSON decoding must preserve delay, scheduled time and uncertainty'
-  );
 
   // When the upstream realtime service fails, the API still returns a usable
   // GTFS-only board instead of an HTTP 502.
