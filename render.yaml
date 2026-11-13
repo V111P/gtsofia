@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: gtsofia-realtime-proxy
+    runtime: node
+    plan: free
+    region: frankfurt
+    rootDir: realtime-proxy
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
