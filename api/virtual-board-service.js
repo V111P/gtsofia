@@ -636,6 +636,7 @@ function createDataContext(data = {}) {
     let hasUpstreamTiming = knownDelay !== null;
     let noDataClearedCoverage = false;
     let hasDownstreamTiming = false;
+    let hasPastDownstreamTiming = false;
 
     for (const item of updates) {
       const relationship = optionalFiniteNumber(item.update?.schedule_relationship) ?? 0;
@@ -643,11 +644,33 @@ function createDataContext(data = {}) {
 
       if (isTargetStop && relationship === 2) return 'no-data';
       if (isTargetStop && relationship === 1) return 'target-update';
-      if (isTargetStop) return 'target-update';
+      if (isTargetStop) {
+        // A StopTimeUpdate that names the target stop but carries no event is
+        // not a prediction. Do not let an empty SCHEDULED update suppress the
+        // timetable fallback.
+        if (getRealtimeEvent(item.update, true)) return 'target-update';
+        continue;
+      }
 
       if (item.stopIndex > targetIndex) {
         const downstreamEvent = getRealtimeEvent(item.update, true);
-        if (downstreamEvent) hasDownstreamTiming = true;
+        if (downstreamEvent && relationship !== 2) {
+          hasDownstreamTiming = true;
+          const downstreamTimestamp = getRealtimeEventTimestamp(
+            downstreamEvent,
+            item.stopIndex,
+            staticInfo.schedule,
+            now
+          );
+          // A timed update at a later stop is not, by itself, proof that the
+          // vehicle has passed this stop: it may simply be the only segment
+          // currently included in a partial TripUpdate. Treat it as passage
+          // only after the predicted time at that later stop has elapsed.
+          if (downstreamTimestamp !== null
+            && downstreamTimestamp <= now.getTime() / 1000) {
+            hasPastDownstreamTiming = true;
+          }
+        }
         continue;
       }
 
@@ -670,10 +693,26 @@ function createDataContext(data = {}) {
       if (isTargetStop) return 'target-update';
     }
 
+    if (hasPastDownstreamTiming) return 'downstream-passed';
     if (knownDelay !== null && hasUpstreamTiming) return 'upstream-coverage';
     if (noDataClearedCoverage) return 'no-data';
     if (hasDownstreamTiming) return 'downstream-only';
     return 'unknown';
+  }
+
+  function getRealtimeEventTimestamp(event, stopIndex, schedule, now) {
+    const timestamp = optionalFiniteNumber(event?.timestamp);
+    if (timestamp !== null) return timestamp;
+
+    const delay = optionalFiniteNumber(event?.delay);
+    if (delay === null) return null;
+
+    const explicitScheduled = optionalFiniteNumber(event?.scheduled_time);
+    if (explicitScheduled !== null) return explicitScheduled + delay;
+
+    const scheduledSeconds = parseGtfsTime(schedule?.times?.[stopIndex]);
+    if (scheduledSeconds === null) return null;
+    return gtfsSecondsToTodayTimestamp(scheduledSeconds, now) + delay;
   }
 
   function getRealtimeEventDelay(event, stopIndex, schedule, now) {
@@ -1128,7 +1167,7 @@ function createDataContext(data = {}) {
     return candidateTripIds.size === 1 && candidateTripIds.has(staticOriginalTripId);
   }
 
-  function realtimeTripHasCourseData(realtimeTrip) {
+  function realtimeTripHasCourseDataAtStop(realtimeTrip, staticArrival, selectedStopId, now) {
     const relationshipName = String(realtimeTrip?.schedule_relationship_name || '').trim().toUpperCase();
     const relationship = optionalFiniteNumber(realtimeTrip?.schedule_relationship);
 
@@ -1145,29 +1184,26 @@ function createDataContext(data = {}) {
     if (relationshipName && relationshipName !== 'SCHEDULED') return false;
     if (relationship !== null && relationship !== 0) return false;
 
-    // Realtime ownership is course-wide, not stop-wide. A trip-level delay or
-    // one timed StopTimeUpdate anywhere along the course is enough to disable
-    // its GTFS fallback at every stop. This also covers partial TripUpdates
-    // that currently contain data only for a later/earlier segment.
-    if (optionalFiniteNumber(realtimeTrip?.trip_delay) !== null) return true;
+    // Only realtime information that covers this stop (or proves that the
+    // vehicle has already passed it) may replace its timetable arrival. A
+    // prediction for a later stop is not course-wide coverage: the feed may
+    // currently expose only a later segment while this stop is still ahead.
+    const staticInfo = findStaticScheduleInfo(
+      staticArrival?.route_id,
+      staticArrival?.original_trip_id,
+      getScheduleDayType(now, calendar)
+    );
+    if (!staticInfo) return false;
 
-    const hasTiming = event => event
-      && (optionalFiniteNumber(event.timestamp) !== null
-        || optionalFiniteNumber(event.delay) !== null);
-
-    if ((Array.isArray(realtimeTrip?.times) ? realtimeTrip.times : []).some(hasTiming)) {
-      return true;
-    }
-
-    return (Array.isArray(realtimeTrip?.stop_time_updates) ? realtimeTrip.stop_time_updates : [])
-      .some(update => {
-        const stopRelationship = optionalFiniteNumber(update?.schedule_relationship);
-        // SKIPPED is itself an explicit realtime instruction, even without a
-        // timestamp. NO_DATA is not: it explicitly says no realtime event is
-        // available and must not, by itself, suppress a timetable fallback.
-        if (stopRelationship === 1) return true;
-        return hasTiming(update?.arrival) || hasTiming(update?.departure);
-      });
+    const stopState = getRealtimeCourseStopUpdateState(
+      realtimeTrip,
+      staticInfo,
+      selectedStopId,
+      now
+    );
+    return stopState === 'target-update'
+      || stopState === 'upstream-coverage'
+      || stopState === 'downstream-passed';
   }
 
   function staticArrivalIsCovered(staticArrival, realtimeRoutes, realtimeTrips, now, allStaticArrivals, selectedStopId) {
@@ -1175,7 +1211,7 @@ function createDataContext(data = {}) {
 
     for (const realtimeTrip of realtimeTrips) {
       if (!staticArrivalMatchesRealtimeDescriptor(staticArrival, realtimeTrip, now, allStaticArrivals, selectedStopId)) continue;
-      if (realtimeTripHasCourseData(realtimeTrip)) return true;
+      if (realtimeTripHasCourseDataAtStop(realtimeTrip, staticArrival, selectedStopId, now)) return true;
     }
 
     // A stop-specific realtime route already contains a usable arrival for
@@ -1242,9 +1278,9 @@ function createDataContext(data = {}) {
     const isMetro = /^M/i.test(selectedStopId) || /^M/i.test(String(selectedStop?.stop_code || ''));
     const rawRealtimeRoutes = isMetro ? [] : (Array.isArray(realtimeBoard?.routes) ? realtimeBoard.routes : []);
     // Complete TripUpdate descriptors are supplied separately from arrivals
-    // at this stop. The service matches the exact course and uses any actual
-    // timed realtime data for that course to suppress its GTFS fallback, even
-    // when the feed currently contains updates for only part of the route.
+    // at this stop. The service matches the exact course and suppresses its
+    // GTFS fallback only when realtime coverage applies to this stop (or a
+    // later timed update confirms the vehicle has already passed it).
     const realtimeTrips = isMetro ? [] : [
       ...(Array.isArray(realtimeBoard?.realtime_trips) ? realtimeBoard.realtime_trips : []),
       ...rawRealtimeRoutes
@@ -1306,8 +1342,13 @@ function createDataContext(data = {}) {
         continue;
       }
 
-      const terminalStopId = (isScheduled && staticInfo?.terminalStopId)
-        ? staticInfo.terminalStopId
+      // For scheduled courses, the final populated GTFS stop (including
+      // legitimate short turns) is authoritative. The last StopTimeUpdate in
+      // a partial realtime feed is merely the last stop currently reported,
+      // not necessarily the vehicle's destination.
+      const terminalStopId = isScheduled
+        ? (staticInfo?.terminalStopId
+          || String(direction?.pattern?.[direction.pattern.length - 1] || '').trim())
         : (String(route?.destination_stop_id || '').trim()
           || staticInfo?.terminalStopId
           || String(direction?.pattern?.[direction.pattern.length - 1] || '').trim());
