@@ -1175,7 +1175,30 @@ function createDataContext(data = {}) {
 
     for (const realtimeTrip of realtimeTrips) {
       if (!staticArrivalMatchesRealtimeDescriptor(staticArrival, realtimeTrip, now, allStaticArrivals, selectedStopId)) continue;
-      if (realtimeTripHasCourseData(realtimeTrip)) return true;
+
+      const relationshipName = String(realtimeTrip?.schedule_relationship_name || '').trim().toUpperCase();
+      const relationship = optionalFiniteNumber(realtimeTrip?.schedule_relationship);
+      if (relationshipName === 'CANCELED' || relationshipName === 'DELETED'
+        || relationship === 3 || relationship === 7) return true;
+
+      // Decide whether realtime replaces the timetable at THIS stop, rather
+      // than letting an update anywhere on the trip hide every static stop.
+      // In particular, NO_DATA clears upstream delay propagation: keep the
+      // scheduled arrival visible until a usable update resumes downstream.
+      const staticInfo = findStaticScheduleInfoByStartTime(
+        String(staticArrival.route_id || '').trim(),
+        String(staticArrival.trip_start_time || '').trim(),
+        staticArrival.direction_id,
+        now
+      );
+      if (!staticInfo) {
+        if (realtimeTripHasCourseData(realtimeTrip)) return true;
+        continue;
+      }
+      const stopState = getRealtimeCourseStopUpdateState(
+        realtimeTrip, staticInfo, selectedStopId, now
+      );
+      if (['target-update', 'upstream-coverage', 'downstream-only'].includes(stopState)) return true;
     }
 
     // A stop-specific realtime route already contains a usable arrival for
