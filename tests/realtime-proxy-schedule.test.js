@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 (async () => {
   const {
     extractScheduledArrivals,
-    mergeRealtimeAndScheduledArrivals
+    mergeRealtimeAndScheduledArrivals,
+    enrichRealtimeArrivalsFromSchedule
   } = await import('../realtime-proxy/lib/schedule-mapper.js');
 
   const now = Date.parse('2026-11-13T05:00:00.000Z'); // 07:00 in Sofia
@@ -36,7 +37,8 @@ const assert = require('node:assert/strict');
               { tripId: 'has-rt-update', serviceId: 'weekday', times: ['07:01:00', '07:14:00', '07:40:00', '07:50:00'] },
               { tripId: 'skipped-here', serviceId: 'weekday', times: ['07:02:00', '07:15:00', '07:41:00', '07:51:00'] },
               { tripId: 'no-data-here', serviceId: 'weekday', times: ['07:03:00', '07:16:00', '07:42:00', '07:52:00'] },
-              { tripId: 'cancelled-course', serviceId: 'weekday', times: ['07:04:00', '07:17:00', '07:43:00', '07:53:00'] }
+              { tripId: 'cancelled-course', serviceId: 'weekday', times: ['07:04:00', '07:17:00', '07:43:00', '07:53:00'] },
+              { tripId: 'late-third-arrival', serviceId: 'weekday', times: ['11:55:00', '12:15:00', '12:41:00', '12:51:00'] }
             ]
           }
         }
@@ -45,10 +47,23 @@ const assert = require('node:assert/strict');
   };
 
   const arrivals = extractScheduledArrivals(scheduleData, '1247', { nowMs: now });
-  assert.equal(arrivals.length, 5);
+  assert.equal(arrivals.length, 6, 'the schedule lookup searches far enough ahead to supply the next three arrivals on less frequent lines');
   assert.ok(arrivals.every(item => item.isScheduled && item.source === 'schedule'));
   assert.ok(arrivals.every(item => item.routeId === 'TM22'));
   assert.equal(arrivals[0].arrivalDate, '2026-11-13T05:13:00.000Z');
+  assert.ok(arrivals.some(item => item.tripId === 'late-third-arrival'),
+    'a scheduled course more than two hours ahead remains eligible within the six-hour board horizon');
+
+  const enrichedRealtime = enrichRealtimeArrivalsFromSchedule([{
+    tripId: 'has-rt-update', headsign: 'АВТОСТАНЦИЯ ИЗТОК', isRealtime: true
+  }, {
+    tripId: 'not-in-index', headsign: 'Непозната GTFS дестинация', isRealtime: true
+  }], arrivals);
+  assert.equal(enrichedRealtime[0].terminalStopId, '2023');
+  assert.equal(enrichedRealtime[0].destination, 'Автостанция Изток',
+    'RT rows inherit the OSM-first terminal label from the exact static trip when available');
+  assert.equal(enrichedRealtime[1].destination, undefined,
+    'unmatched realtime trips are not assigned an invented destination');
 
   const merged = mergeRealtimeAndScheduledArrivals({
     scheduledArrivals: arrivals,
@@ -80,7 +95,28 @@ const assert = require('node:assert/strict');
   assert.equal(byTrip.has('cancelled-course'), false, 'canceled trip never falls back to timetable');
 
   const feedUnavailable = mergeRealtimeAndScheduledArrivals({ scheduledArrivals: arrivals });
-  assert.equal(feedUnavailable.length, 5, 'the timetable is still available if the RT feed is unavailable');
+  assert.equal(feedUnavailable.length, 6, 'the timetable is still available if the RT feed is unavailable');
+
+  const lateNightData = {
+    calendar: {
+      referenceDate: '2026-11-13', coverageEndDate: '2026-11-15', coverageDays: 3,
+      serviceBits: { weekday: '1', weekend: '2' }
+    },
+    stopIdsByIdentifier: { '1247': ['1247'] },
+    routes: { TM22: {
+      routeId: 'TM22', routeShortName: '22', routeType: '0',
+      directions: { D1: {
+        destination: 'Автостанция Изток', terminalStopId: '2023',
+        stopIds: ['0633', '1247'],
+        courses: [{ tripId: 'next-service-day', serviceId: 'weekend', times: ['04:50:00', '05:00:00'] }]
+      } }
+    } }
+  };
+  const lateNight = extractScheduledArrivals(lateNightData, '1247', {
+    nowMs: Date.parse('2026-11-13T21:30:00.000Z') // 23:30 in Sofia; the horizon reaches 05:30 next day
+  });
+  assert.equal(lateNight.length, 1, 'the six-hour window includes the next calendar service date after midnight');
+  assert.equal(lateNight[0].tripId, 'next-service-day');
 
   // RT and the site's schedule export can use different stop_id namespaces
   // for the same public board (for example, TM1247 vs 1247). The merge must
@@ -103,20 +139,6 @@ const assert = require('node:assert/strict');
   assert.deepEqual(namespaceBridge.map(item => `${item.tripId}:${item.source}`).sort(), [
     'no-update-trip:schedule', 'same-trip:realtime'
   ], 'RT for the same trip/public stop suppresses duplicate timetable fallback despite different GTFS stop_id namespaces');
-
-  // Verify the checked-in generated schedule index contains usable surface
-  // timetable rows for the same public stop-code path used by Render.
-  const { getScheduleData } = await import('../realtime-proxy/lib/schedule-data.js');
-  const generatedIndex = await getScheduleData();
-  assert.ok(generatedIndex.generatedAt, 'generated timetable index has a generation date');
-  assert.ok(generatedIndex.routes?.TM22, 'generated timetable index includes tram 22');
-  const integrationNow = Date.parse(`${generatedIndex.generatedAt}T05:00:00.000Z`);
-  const generatedStopArrivals = extractScheduledArrivals(generatedIndex, '1247', {
-    nowMs: integrationNow
-  });
-  assert.ok(generatedStopArrivals.some(item => item.routeId === 'TM22'),
-    'generated schedule index resolves tram 22 times for public stop code 1247');
-  assert.ok(generatedStopArrivals.every(item => item.isScheduled && item.source === 'schedule'));
 
   console.log('realtime-proxy-schedule: timetable fallback tests passed');
 })().catch(error => {

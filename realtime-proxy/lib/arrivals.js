@@ -7,11 +7,11 @@ import { getTripLookup, getStopIdsByIdentifier } from './gtfs-static.js';
 import { fetchTripUpdates, getRealtimeFeedTimestamp } from './gtfs-realtime.js';
 import { extractRealtimeArrivals } from './arrival-mapper.js';
 import { getScheduleData } from './schedule-data.js';
-import { extractScheduledArrivals, mergeRealtimeAndScheduledArrivals } from './schedule-mapper.js';
+import { extractScheduledArrivals, mergeRealtimeAndScheduledArrivals, enrichRealtimeArrivalsFromSchedule } from './schedule-mapper.js';
 
 export { extractRealtimeArrivals, extractScheduledArrivals, mergeRealtimeAndScheduledArrivals };
 
-const MAX_ARRIVALS_PER_REQUEST = 100;
+const MAX_ARRIVALS_PER_REQUEST = 1000;
 
 export async function getArrivalsByIdentifier(code, options = {}) {
   const requestedLimit = Number.parseInt(options.limit, 10);
@@ -41,7 +41,7 @@ export async function getArrivalsByIdentifier(code, options = {}) {
       ? String(stopIdsResult.reason?.message || stopIdsResult.reason || 'Static stop lookup unavailable.')
       : (requestedStopIds.length ? '' : 'No GTFS stop IDs matched this public stop identifier.'));
 
-  const realtimeArrivals = requestedStopIds.length
+  const rawRealtimeArrivals = requestedStopIds.length
     ? extractRealtimeArrivals(updates, requestedStopIds, {
         now,
         limit: MAX_ARRIVALS_PER_REQUEST,
@@ -49,26 +49,31 @@ export async function getArrivalsByIdentifier(code, options = {}) {
       })
     : [];
 
-  const mergedArrivals = mergeRealtimeAndScheduledArrivals({
+  // The compact timetable index contains the OSM-first terminal destination
+  // for the exact static trip. Reuse it on RT records too, so a GTFS trip_headsign
+  // does not leak through to the board when it is not an OSM stop label. The
+  // Vercel mapper can still override this for a recognized RT short-turn headsign.
+  const realtimeArrivals = enrichRealtimeArrivalsFromSchedule(
+    rawRealtimeArrivals,
+    scheduledArrivals
+  );
+
+  const arrivals = mergeRealtimeAndScheduledArrivals({
     realtimeArrivals,
     scheduledArrivals,
     updates,
     requestedStopIds,
     stopIdentifier: code
-  });
-  const arrivals = mergedArrivals.slice(0, limit);
+  }).slice(0, limit);
 
   const realtimeCount = arrivals.filter(arrival => arrival.isRealtime === true).length;
   const scheduledCount = arrivals.filter(arrival => arrival.isScheduled === true).length;
-  const scheduledMergedCount = mergedArrivals.filter(arrival => arrival.isScheduled === true).length;
 
   return {
     arrivals,
     count: arrivals.length,
     realtimeCount,
     scheduledCount,
-    scheduledCandidateCount: scheduledArrivals.length,
-    scheduledMergedCount,
     realtimeAvailable,
     realtimeError,
     feedTimestamp: realtimeAvailable ? getRealtimeFeedTimestamp() : null,

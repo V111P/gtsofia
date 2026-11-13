@@ -72,7 +72,7 @@ def build_metro_board_data(routes, directions, schedules, calendar):
     """Build a compact, metro-only timetable dataset for virtual boards.
 
     Metro has no usable RT arrival feed in this integration. Its virtual-board
-    rows are therefore explicitly scheduled, while surface modes remain RT-only.
+    rows are therefore explicitly scheduled; surface modes combine explicit RT events with the compact static timetable fallback.
     """
     routes_by_id = {
         str(route.get("route_id") or "").strip(): route

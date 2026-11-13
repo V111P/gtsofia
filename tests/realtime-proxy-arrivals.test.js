@@ -76,6 +76,16 @@ const assert = require('node:assert/strict');
   const empty = extractRealtimeArrivals(entities, ['not-this-stop'], { now, tripLookup });
   assert.deepEqual(empty, [], 'no schedule-based row is synthesized when the stop has no RT event');
 
+
+  const manyEntities = Array.from({ length: 150 }, (_, index) => ({
+    tripId: `many-${index}`,
+    routeId: `ROUTE-${index}`,
+    stopTimeUpdates: [{ stopId: '1247', arrival: { time: time(index + 1) }, scheduleRelationship: 0 }]
+  }));
+  const manyArrivals = extractRealtimeArrivals(manyEntities, ['1247'], { now });
+  assert.equal(manyArrivals.length, 150,
+    'the proxy must not truncate a busy stop to 100 global RT rows before the board groups arrivals by route and direction');
+
   console.log('realtime-proxy-arrivals: explicit RT-only extraction tests passed');
 })().catch(error => {
   console.error(error);

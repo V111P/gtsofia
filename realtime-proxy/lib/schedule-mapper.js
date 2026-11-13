@@ -4,7 +4,7 @@
  * schedules and is deployed with Render. It is used only when an exact RT
  * stop-time event is not available for the same trip and stop.
  */
-const MAX_LOOKAHEAD_SECONDS = 2 * 60 * 60;
+const MAX_LOOKAHEAD_SECONDS = 6 * 60 * 60;
 const PAST_GRACE_MS = 60_000;
 const SOFIA_TIME_ZONE = 'Europe/Sofia';
 
@@ -98,6 +98,10 @@ export function extractScheduledArrivals(scheduleData, stopIdentifier, options =
     { dateKey: nowParts.dateKey, previousDay: false },
     { dateKey: shiftDateKey(nowParts.dateKey, -1), previousDay: true }
   ];
+  const horizonDateKey = localDateParts(nowMs + MAX_LOOKAHEAD_SECONDS * 1000).dateKey;
+  if (horizonDateKey !== nowParts.dateKey) {
+    serviceDates.push({ dateKey: horizonDateKey, previousDay: false });
+  }
   const output = [];
   const seen = new Set();
   const maxTimestamp = nowMs + MAX_LOOKAHEAD_SECONDS * 1000;
@@ -162,6 +166,21 @@ export function extractScheduledArrivals(scheduleData, stopIdentifier, options =
 
   output.sort((left, right) => Date.parse(left.arrivalDate) - Date.parse(right.arrivalDate));
   return output;
+}
+
+export function enrichRealtimeArrivalsFromSchedule(realtimeArrivals = [], scheduledArrivals = []) {
+  const scheduleByTripId = new Map(
+    scheduledArrivals.map(arrival => [normalize(arrival.tripId), arrival])
+  );
+  return realtimeArrivals.map(arrival => {
+    const scheduled = scheduleByTripId.get(normalize(arrival.tripId));
+    if (!scheduled) return arrival;
+    return {
+      ...arrival,
+      terminalStopId: scheduled.terminalStopId || '',
+      destination: scheduled.destination || arrival.destination || ''
+    };
+  });
 }
 
 export function mergeRealtimeAndScheduledArrivals({

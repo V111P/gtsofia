@@ -16,42 +16,8 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/health', async (_req, res) => {
-  try {
-    const scheduleData = await getScheduleData();
-    const routeRows = Object.values(scheduleData.routes || {});
-    const directionCount = routeRows.reduce(
-      (total, route) => total + Object.keys(route.directions || {}).length, 0
-    );
-    const courseCount = routeRows.reduce((total, route) =>
-      total + Object.values(route.directions || {}).reduce(
-        (directionTotal, direction) => directionTotal + (direction.courses || []).length, 0
-      ), 0
-    );
-
-    return res.json({
-      status: 'ok',
-      service: 'gtsofia-realtime-proxy',
-      timestamp: new Date().toISOString(),
-      scheduleIndex: {
-        loaded: true,
-        schemaVersion: scheduleData.schemaVersion,
-        generatedAt: scheduleData.generatedAt,
-        coverageEndDate: scheduleData.calendar?.coverageEndDate || null,
-        routeCount: routeRows.length,
-        directionCount,
-        courseCount,
-        stopIdentifierCount: Object.keys(scheduleData.stopIdsByIdentifier || {}).length
-      }
-    });
-  } catch (error) {
-    return res.status(503).json({
-      status: 'degraded',
-      service: 'gtsofia-realtime-proxy',
-      timestamp: new Date().toISOString(),
-      scheduleIndex: { loaded: false, error: error?.message || 'Schedule index unavailable.' }
-    });
-  }
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'gtsofia-realtime-proxy', timestamp: new Date().toISOString() });
 });
 
 app.get('/api/stops/:identifier/arrivals', async (req, res) => {
@@ -62,7 +28,7 @@ app.get('/api/stops/:identifier/arrivals', async (req, res) => {
 
   const requestedLimit = Number.parseInt(req.query.limit, 10);
   const limit = Number.isFinite(requestedLimit)
-    ? Math.min(Math.max(requestedLimit, 1), 100)
+    ? Math.min(Math.max(requestedLimit, 1), 1000)
     : 30;
 
   try {
@@ -79,8 +45,6 @@ app.get('/api/stops/:identifier/arrivals', async (req, res) => {
       realtimeError: result.realtimeError || null,
       realtimeCount: result.realtimeCount,
       scheduledCount: result.scheduledCount,
-      scheduledCandidateCount: result.scheduledCandidateCount,
-      scheduledMergedCount: result.scheduledMergedCount,
       scheduleGeneratedAt: result.scheduleGeneratedAt,
       arrivals: result.arrivals,
       count: result.count

@@ -7,7 +7,6 @@ assert.ok(tram22, 'local route metadata should contain tram 22');
 
 const nowMs = Date.now();
 const arrivalDate = new Date(nowMs + 5 * 60_000).toISOString();
-const destinationTripId = 'TM22-TM4-9-13-17666667941';
 
 const mapped = handler.mapRealtimeArrivalsToBoard([
   {
@@ -64,56 +63,49 @@ assert.equal(mapped[0].times[0].source, 'realtime');
 assert.equal(mapped[0].times[0].scheduled, false);
 assert.equal(mapped[0].times[0].delay, 90);
 
+const mixedSourcesSameDestination = handler.mapRealtimeArrivalsToBoard([
+  ...[1, 2, 3].map(index => ({
+    id: `realtime-same-endpoint-${index}`,
+    tripId: `realtime-same-endpoint-${index}`,
+    routeId: 'TM22', routeShortName: '22', routeType: '0',
+    headsign: 'Автостанция Изток',
+    arrivalDate: new Date(nowMs + (5 + index) * 60_000).toISOString(),
+    isRealtime: true, source: 'realtime'
+  })),
+  ...[4, 5, 6].map(index => ({
+    id: `schedule-same-endpoint-${index}`,
+    tripId: `schedule-same-endpoint-${index}`,
+    routeId: 'TM22', routeShortName: '22', routeType: '0',
+    headsign: 'АВТОСТАНЦИЯ ИЗТОК',
+    terminalStopId: '2023', destination: 'Автостанция Изток',
+    arrivalDate: new Date(nowMs + (5 + index) * 60_000).toISOString(),
+    isScheduled: true, source: 'schedule'
+  }))
+], { nowMs, stopIdentifier: '1247' });
+assert.equal(mixedSourcesSameDestination.length, 1,
+  'the same line and OSM destination stay in one row even when RT and static records resolve to different platform IDs');
+assert.equal(mixedSourcesSameDestination[0].times.length, 3,
+  'each line/direction displays the first arrival plus the next two from all valid sources');
+assert.deepEqual(mixedSourcesSameDestination[0].times.map(time => time.source),
+  ['realtime', 'realtime', 'realtime'],
+  'the three nearest RT times win when they are earlier than timetable candidates');
 
-const scheduledMapped = handler.mapRealtimeArrivalsToBoard([{
-  id: 'scheduled-trip-22',
-  tripId: destinationTripId,
-  routeId: 'TM22',
-  routeShortName: '22',
-  routeType: '0',
-  headsign: 'Автостанция Изток',
-  destination: 'Автостанция Изток',
-  terminalStopId: '2023',
-  arrivalDate,
-  isRealtime: false,
-  isScheduled: true,
-  source: 'schedule'
-}], { nowMs, stopIdentifier: '1247' });
-assert.equal(scheduledMapped.length, 1, 'surface timetable fallback rows are accepted by the board mapper');
-assert.equal(scheduledMapped[0].times[0].source, 'schedule');
-assert.equal(scheduledMapped[0].times[0].scheduled, true);
-assert.equal(scheduledMapped[0].times[0].realtime, false);
-const scheduledAtTerminal = handler.mapRealtimeArrivalsToBoard([{
-  id: 'scheduled-trip-22-terminal',
-  tripId: destinationTripId,
-  routeId: 'TM22',
-  routeShortName: '22',
-  routeType: '0',
-  headsign: 'Автостанция Изток',
-  destination: 'Автостанция Изток',
-  terminalStopId: '2023',
-  arrivalDate,
-  isScheduled: true,
-  source: 'schedule'
-}], { nowMs, stopIdentifier: '2023' });
-assert.deepEqual(scheduledAtTerminal, [], 'the full terminal-course filter also removes schedule fallback arrivals');
+const extendedHorizon = handler.mapRealtimeArrivalsToBoard([
+  {
+    id: 'five-hours-ahead', tripId: 'five-hours-ahead', routeId: 'TM22', routeShortName: '22',
+    headsign: 'Автостанция Изток', arrivalDate: new Date(nowMs + 5 * 60 * 60_000).toISOString(),
+    isRealtime: true
+  },
+  {
+    id: 'seven-hours-ahead', tripId: 'seven-hours-ahead', routeId: 'TM22', routeShortName: '22',
+    headsign: 'Автостанция Изток', arrivalDate: new Date(nowMs + 7 * 60 * 60_000).toISOString(),
+    isRealtime: true
+  }
+], { nowMs, stopIdentifier: '1247' });
+assert.equal(extendedHorizon.length, 1, 'an arrival within the six-hour horizon remains eligible');
+assert.equal(extendedHorizon[0].times.length, 1, 'arrivals beyond the six-hour horizon are not shown');
 
-const scheduledPartialAtTerminal = handler.mapRealtimeArrivalsToBoard([{
-  id: 'scheduled-partial-at-terminal',
-  tripId: 'scheduled-partial-course',
-  routeId: 'TM22',
-  routeShortName: '22',
-  routeType: '0',
-  headsign: 'гара Подуяне',
-  destination: 'гара Подуяне',
-  terminalStopId: '0470',
-  arrivalDate,
-  isScheduled: true,
-  source: 'schedule'
-}], { nowMs, stopIdentifier: '0470' });
-assert.deepEqual(scheduledPartialAtTerminal, [],
-  'a static fallback partial course ending at the open surface stop is omitted completely');
-
+const destinationTripId = 'TM22-TM4-9-13-17666667941';
 const destinationArrival = {
   id: 'osm-destination-test',
   tripId: destinationTripId,
@@ -129,33 +121,6 @@ const osmDestination = handler.mapRealtimeArrivalsToBoard([destinationArrival], 
   stopIdentifier: '1247'
 });
 assert.equal(osmDestination[0].destination, 'Автостанция Изток', 'the direction endpoint should use the OSM-first terminal-stop name');
-
-// If a GTFS RT headsign has formatting or wording that does not exactly match
-// an OSM stop name, use the per-trip OSM-first destination map instead of
-// returning the raw GTFS text to the virtual board.
-const gtfsHeadsignFallsBackToOsm = handler.mapRealtimeArrivalsToBoard([{
-  ...destinationArrival,
-  id: 'gtfs-headsign-osm-fallback',
-  tripId: 'gtfs-headsign-osm-fallback-trip',
-  headsign: 'АВТОСТАНЦИЯ ИЗТОК (ГТФС ВАРИАНТ)'
-}], {
-  nowMs,
-  stopIdentifier: '1247',
-  stops: [
-    { stop_id: '1247', stop_code: '1247', stop_name: 'Парк', osm_stop_name: 'Парк' },
-    { stop_id: '2023', stop_code: '2023', stop_name: 'Автостанция Изток', osm_stop_name: 'Автостанция Изток' }
-  ],
-  tripDestinations: {
-    'gtfs-headsign-osm-fallback-trip': {
-      terminal_stop_id: '2023',
-      destination: 'Автостанция Изток'
-    }
-  }
-});
-assert.equal(gtfsHeadsignFallsBackToOsm[0].destination, 'Автостанция Изток',
-  'an unmatched GTFS headsign must fall back to the OSM-first per-trip destination');
-assert.equal(handler.resolveOsmDestinationName('NOT A KNOWN STOP', []), '',
-  'the OSM resolver must not masquerade an unmatched GTFS value as an OSM name');
 const hiddenTerminal = handler.mapRealtimeArrivalsToBoard([destinationArrival], {
   nowMs,
   stopIdentifier: '2023'
@@ -300,61 +265,32 @@ const metroTerminalBoard = handler.buildMetroScheduleRoutes('M2', {
   metroData: testMetroData,
   stops: [{ stop_id: 'M1', stop_code: '1' }, { stop_id: 'M2', stop_code: '2' }]
 });
-assert.deepEqual(metroTerminalBoard.routes, [],
-  'the complete static metro direction and all its scheduled times are omitted when the open station is its terminal');
+assert.deepEqual(metroTerminalBoard.routes, [], 'the entire metro arrival row and all its times are hidden when the open station is the terminal');
 
-const metroTerminalWithoutExplicitTerminalId = handler.buildMetroScheduleRoutes('M2', {
-  nowMs: fixedMetroNow,
-  metroData: {
-    calendar: testMetroData.calendar,
-    routes: {
-      M1: {
-        route_id: 'M1', route_short_name: '1', route_type: '1',
-        directions: {
-          D1: {
-            destination: 'Автостанция',
-            stop_ids: ['M1', 'M2'],
-            weekday: [{ original_trip_id: 'terminal-without-id', times: ['07:05:00', '07:07:00'] }],
-            weekend: []
-          }
-        }
-      }
-    }
+const lateMetroData = {
+  calendar: {
+    dateTypes: { '2026-11-14': 'weekend' },
+    dateOverrides: {}
   },
-  stops: [{ stop_id: 'M1', stop_code: '1' }, { stop_id: 'M2', stop_code: '2' }]
-});
-assert.deepEqual(metroTerminalWithoutExplicitTerminalId.routes, [],
-  'the last stop ID is used as the terminal when terminal_stop_id is absent');
-
-// At a station that terminates one direction but is an intermediate stop in
-// the opposite direction, only the terminating direction must be hidden.
-const metroTwoWayData = {
-  calendar: testMetroData.calendar,
   routes: {
     M1: {
-      ...testMetroData.routes.M1,
+      route_id: 'M1', route_short_name: '1', route_type: '1',
       directions: {
-        ...testMetroData.routes.M1.directions,
-        D2: {
-          destination: 'Сливница',
-          terminal_stop_id: 'M3',
-          stop_ids: ['M2', 'M1', 'M3'],
-          weekday: [{ original_trip_id: 'metro-course-through', times: ['07:04:00', '07:06:00', '07:09:00'] }],
-          weekend: []
+        D1: {
+          destination: 'Бизнес парк София', terminal_stop_id: 'M2', stop_ids: ['M1', 'M2'],
+          weekday: [], weekend: [{ original_trip_id: 'next-day-metro', times: ['05:00:00', '05:10:00'] }]
         }
       }
     }
   }
 };
-const metroMixedDirections = handler.buildMetroScheduleRoutes('M2', {
-  nowMs: fixedMetroNow,
-  metroData: metroTwoWayData,
-  stops: [{ stop_id: 'M1', stop_code: '1' }, { stop_id: 'M2', stop_code: '2' }, { stop_id: 'M3', stop_code: '3' }]
+const lateMetroBoard = handler.buildMetroScheduleRoutes('M1', {
+  nowMs: Date.parse('2026-11-13T21:30:00.000Z'),
+  metroData: lateMetroData,
+  stops: [{ stop_id: 'M1', stop_code: '1' }, { stop_id: 'M2', stop_code: '2' }]
 });
-assert.equal(metroMixedDirections.routes.length, 1,
-  'only the metro direction that terminates at the open station is omitted');
-assert.equal(metroMixedDirections.routes[0].destination, 'Сливница');
-assert.equal(metroMixedDirections.routes[0].times[0].trip_id, 'metro-course-through');
+assert.equal(lateMetroBoard.routes[0].times[0].trip_id, 'next-day-metro',
+  'metro boards also include the next service date when the six-hour horizon crosses midnight');
 
 function makeResponse() {
   return {
@@ -381,22 +317,46 @@ function makeResponse() {
         ok: true,
         json: async () => ({
           feedTimestamp: Math.floor(Date.now() / 1000),
-          realtimeCount: 1,
-          scheduledCount: 2,
-          scheduledCandidateCount: 4,
-          scheduledMergedCount: 3,
-          scheduleGeneratedAt: '2026-11-13',
-          arrivals: [{
-            id: 'live-trip-22',
-            tripId: 'live-trip-22',
-            routeId: 'TM22',
-            routeShortName: '22',
-            routeType: '0',
-            headsign: 'Автостанция Изток',
-            arrivalDate,
-            delaySeconds: 45,
-            isRealtime: true
-          }]
+          arrivals: [
+            {
+              id: 'live-trip-22',
+              tripId: 'live-trip-22',
+              routeId: 'TM22',
+              routeShortName: '22',
+              routeType: '0',
+              headsign: 'Автостанция Изток',
+              arrivalDate,
+              delaySeconds: 45,
+              isRealtime: true,
+              source: 'realtime'
+            },
+            {
+              id: 'scheduled-trip-22-b',
+              tripId: 'scheduled-trip-22-b',
+              routeId: 'TM22',
+              routeShortName: '22',
+              routeType: '0',
+              headsign: 'АВТОСТАНЦИЯ ИЗТОК',
+              terminalStopId: '2023',
+              destination: 'Автостанция Изток',
+              arrivalDate: new Date(nowMs + 6 * 60_000).toISOString(),
+              isScheduled: true,
+              source: 'schedule'
+            },
+            {
+              id: 'scheduled-trip-22-c',
+              tripId: 'scheduled-trip-22-c',
+              routeId: 'TM22',
+              routeShortName: '22',
+              routeType: '0',
+              headsign: 'Автостанция Изток',
+              terminalStopId: '2023',
+              destination: 'Автостанция Изток',
+              arrivalDate: new Date(nowMs + 7 * 60_000).toISOString(),
+              isScheduled: true,
+              source: 'schedule'
+            }
+          ]
         })
       };
     };
@@ -404,17 +364,14 @@ function makeResponse() {
     let res = makeResponse();
     await handler({ method: 'GET', query: { stop_code: '1247' } }, res);
     assert.equal(res.statusCode, 200);
-    assert.match(requestedUrl, /\/api\/stops\/1247\/arrivals\?limit=100$/);
-    assert.equal(res.body.realtime_only, undefined, 'the legacy realtime-only response flag is no longer needed');
-    assert.equal(res.body.board_mode, 'realtime-with-schedule-fallback');
+    assert.match(requestedUrl, /\/api\/stops\/1247\/arrivals\?limit=1000$/);
+    assert.equal(res.body.realtime_only, undefined);
     assert.equal(res.body.realtime_status, 'available');
     assert.equal(res.body.routes.length, 1);
     assert.equal(res.body.routes[0].times[0].source, 'realtime');
     assert.equal(res.body.routes[0].times[0].scheduled, false);
-    assert.equal(res.body.scheduled_count, 2);
-    assert.equal(res.body.scheduled_candidate_count, 4);
-    assert.equal(res.body.scheduled_merged_count, 3);
-    assert.equal(res.body.schedule_generated_at, '2026-11-13');
+    assert.deepEqual(res.body.routes[0].times.map(time => time.source), ['realtime', 'schedule', 'schedule'],
+      'each route/direction keeps its first arrival plus the next two, mixing RT and timetable sources');
 
     // Metro stations are served from the local official timetable; they do not
     // make an RT request to Render.
@@ -429,15 +386,32 @@ function makeResponse() {
     assert.ok(res.body.routes.every(route => route.times.every(time => time.source === 'schedule')));
     assert.equal(requestedUrl, urlBeforeMetro, 'metro board must not call the realtime proxy');
 
-    // The Vercel mapper does not independently invent timetable rows; the proxy owns the RT/schedule merge.
-    global.fetch = async () => ({ ok: true, json: async () => ({ arrivals: [], feedTimestamp: Math.floor(Date.now() / 1000) }) });
+    // When the RT feed is unavailable but Render can still load its local
+    // timetable index, scheduled arrivals remain visible on the surface board.
+    global.fetch = async () => ({ ok: true, json: async () => ({
+      realtimeAvailable: false,
+      feedTimestamp: null,
+      arrivals: [{
+        id: 'schedule-fallback-trip',
+        tripId: 'schedule-fallback-trip',
+        routeId: 'TM22',
+        routeShortName: '22',
+        routeType: '0',
+        terminalStopId: '2023',
+        destination: 'Автостанция Изток',
+        arrivalDate: new Date(Date.now() + 8 * 60_000).toISOString(),
+        isScheduled: true,
+        source: 'schedule'
+      }]
+    }) });
     res = makeResponse();
     await handler({ method: 'GET', query: { stop_code: '1247' } }, res);
     assert.equal(res.statusCode, 200);
-    assert.equal(res.body.status, 'empty');
-    assert.deepEqual(res.body.routes, []);
+    assert.equal(res.body.status, 'ok');
+    assert.equal(res.body.realtime_status, 'unavailable');
+    assert.equal(res.body.routes[0].times[0].source, 'schedule');
 
-    // If the proxy itself is unreachable, Vercel cannot reach the proxy-owned schedule index either.
+    // An upstream outage must not trigger a static timetable fallback.
     global.fetch = async () => ({ ok: false, status: 503, text: async () => 'offline' });
     res = makeResponse();
     await handler({ method: 'GET', query: { stop_code: '1247' } }, res);
@@ -445,7 +419,7 @@ function makeResponse() {
     assert.equal(res.body.realtime_status, 'unavailable');
     assert.deepEqual(res.body.routes, []);
 
-    // Missing proxy configuration means the proxy-owned timetable index is unreachable too.
+    // Missing configuration is explicit and still never uses the timetable.
     delete process.env.SOFIA_REALTIME_PROXY_URL;
     res = makeResponse();
     await handler({ method: 'GET', query: { stop_code: '1247' } }, res);

@@ -38,7 +38,7 @@ The service listens on `http://localhost:10000` by default (or `PORT`).
 - `GET /health`
 - `GET /api/stops/:stopIdOrCode/arrivals?limit=30`
 
-Example: `GET /api/stops/1247/arrivals?limit=100`. The response exposes `realtimeCount`, `scheduledCount`, `realtimeAvailable`, `feedTimestamp`, `scheduleGeneratedAt`, and an `arrivals` array. Each arrival carries `source: "realtime"` or `source: "schedule"`.
+Example: `GET /api/stops/1247/arrivals?limit=1000`. The response exposes `realtimeCount`, `scheduledCount`, `realtimeAvailable`, `feedTimestamp`, `scheduleGeneratedAt`, and an `arrivals` array. Each arrival carries `source: "realtime"` or `source: "schedule"`. The proxy returns all candidates within the six-hour horizon (up to 1000 rows for the virtual-board request); Vercel groups them by route and normalized OSM destination and takes the next three.
 
 ## Deploy to Render
 

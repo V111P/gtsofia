@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const sourcePath = path.join(__dirname, '..', 'virtual-boards.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+const pageSource = fs.readFileSync(path.join(__dirname, '..', 'virtual-boards.html'), 'utf8');
 const context = {
   console,
   Math,
@@ -12,7 +13,7 @@ const context = {
   URLSearchParams,
   localStorage: { getItem: () => '[]', setItem() {} },
   document: { addEventListener() {} },
-  window: {},
+  window: { GTSofiaVirtualBoardArrivals: require('../virtual-board-arrival-utils.js') },
   Date
 };
 context.globalThis = context;
@@ -73,14 +74,14 @@ assert.doesNotMatch(source, /__gtsofiaVirtualBoardTestInternals/,
   'the browser bundle must not expose test-only internals');
 assert.doesNotMatch(source, /rememberRealtimeArrivalPredictions|reconcileRealtimeCoursePresence|suppressPassedRealtimeFallbacks/,
   'the frontend must not keep or reconcile trip history to recreate board arrivals');
-assert.match(source, /time\?\.source === 'schedule' \|\| time\?\.scheduled === true/,
-  'the renderer accepts timetable rows only through the metro schedule exception');
-assert.match(source, /const isMetro = route\?\.meta\?\.type === 'metro'/,
-  'timetable arrivals are restricted to routes classified as metro');
+assert.match(source, /GTSofiaVirtualBoardArrivals\.normalizeRoutes/,
+  'the frontend uses the shared source normalizer so surface rows may mix RT and schedule times');
+assert.match(pageSource, /virtual-board-arrival-utils\.js/,
+  'the page loads the tested source normalizer before the board renderer');
 assert.doesNotMatch(source, /По разписание/,
   'metro timetable arrivals do not display a scheduled label');
-assert.match(source, /Няма налични realtime пристигания/,
-  'an empty surface transport response must be described as an empty realtime board');
+assert.match(source, /Няма предстоящи пристигания/,
+  'an empty surface board uses a neutral empty-state message');
 assert.match(source, /Няма предстоящи метрокурсове\./,
   'empty metro boards use a neutral empty-state message');
 assert.match(source, /Never keep an old prediction visible/,
@@ -117,7 +118,7 @@ renderBoardList(panel, {
   }]
 });
 assert.equal(panelElements['.virtual-board-list'].innerHTML,
-  '<div class="virtual-board-no-data">Няма налични realtime пристигания.</div>',
+  '<div class="virtual-board-no-data">Няма предстоящи пристигания.</div>',
   'a route without a destination is omitted in full, including line identity and all arrival times');
 assert.doesNotMatch(source, /vb-time-block--no-direction/,
   'the renderer no longer has a time-only layout for terminal courses');
@@ -142,6 +143,30 @@ assert.doesNotMatch(panelElements['.virtual-board-list'].innerHTML, /По раз
   'metro times display without schedule or realtime-disclaimer labels');
 assert.match(panelElements['.virtual-board-list'].innerHTML, /Бизнес парк София/,
   'metro destination remains visible');
+
+
+renderBoardList(panel, {
+  status: 'ok',
+  board_mode: 'realtime-with-schedule-fallback',
+  realtime_status: 'available',
+  loaded_at: now,
+  routes: [{
+    route_id: 'TM22',
+    route_ref: '22',
+    destination: 'Автостанция Изток',
+    meta: { number: '22', type: 'tram', color: '#F7941D', textColor: '#FFFFFF' },
+    times: [
+      { timestamp: now + 300, source: 'realtime', realtime: true, scheduled: false },
+      { timestamp: now + 600, source: 'schedule', realtime: false, scheduled: true },
+      { timestamp: now + 900, source: 'schedule', realtime: false, scheduled: true }
+    ]
+  }]
+});
+assert.equal((panelElements['.virtual-board-list'].innerHTML.match(/class="vb-next-time"/g) || []).length, 2,
+  'surface transport displays one first arrival plus two subsequent times even when fallback times are static');
+assert.match(panelElements['.virtual-board-list'].innerHTML, /Автостанция Изток/);
+assert.match(panelElements['.virtual-board-list'].innerHTML, /vb-arrival-live/,
+  'the first time keeps its realtime indicator when it is an RT event');
 
 assert.doesNotMatch(source, /setInterval\s*\(/,
   'auto refresh must use chained timeouts, not overlapping intervals');

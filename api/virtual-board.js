@@ -7,7 +7,7 @@ const { getRouteMetadata } = require('../route-metadata');
 const SOFIA_TIME_ZONE = 'Europe/Sofia';
 const PROXY_TIMEOUT_MS = 40_000;
 const MAX_ARRIVALS_PER_LINE = 3;
-const MAX_LOOKAHEAD_SECONDS = 2 * 60 * 60;
+const MAX_LOOKAHEAD_SECONDS = 6 * 60 * 60;
 const PAST_GRACE_MS = 60_000;
 
 const routesById = new Map(
@@ -98,28 +98,121 @@ function getRouteForArrival(arrival) {
   };
 }
 
+const OSM_DESTINATION_FIELDS = [
+  'osm_full_name_bg',
+  'osm_stop_name',
+  'osm_name'
+];
+
+const STOP_NAME_ALIAS_FIELDS = [
+  ...OSM_DESTINATION_FIELDS,
+  'gtfs_stop_name',
+  'stop_name',
+  'name'
+];
+
+function getOsmStopName(stop) {
+  for (const field of OSM_DESTINATION_FIELDS) {
+    const value = normalizeText(stop?.[field]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function getStopIdentifierValue(stop) {
+  return normalizeText(stop?.stop_id || stop?.stop_code);
+}
+
 function findStopsMatchingName(value, stops = stopsData) {
   const normalized = normalizeStopName(value);
   if (!normalized) return [];
-  const fields = [
-    'osm_full_name_bg', 'osm_stop_name', 'osm_name', 'stop_name',
-    'gtfs_stop_name', 'name'
-  ];
+  const rows = (Array.isArray(stops) ? stops : []).filter(stop =>
+    STOP_NAME_ALIAS_FIELDS.some(field => normalizeStopName(stop?.[field]) === normalized)
+  );
+
+  // OSM-name matches come first. This prevents a GTFS-only duplicate record
+  // from winning merely because it occurs earlier in stops.json.
+  return rows.sort((left, right) => {
+    const leftOsmMatch = OSM_DESTINATION_FIELDS.some(field =>
+      normalizeStopName(left?.[field]) === normalized
+    );
+    const rightOsmMatch = OSM_DESTINATION_FIELDS.some(field =>
+      normalizeStopName(right?.[field]) === normalized
+    );
+    return Number(rightOsmMatch) - Number(leftOsmMatch);
+  });
+}
+
+function findStopsMatchingIdentifier(identifier, stops = stopsData) {
+  const normalized = normalizeText(identifier);
+  if (!normalized) return [];
   return (Array.isArray(stops) ? stops : []).filter(stop =>
-    fields.some(field => normalizeStopName(stop?.[field]) === normalized)
+    normalizeText(stop?.stop_id) === normalized
+    || normalizeText(stop?.stop_code) === normalized
   );
 }
 
-function resolveOsmDestinationName(value, stops = stopsData) {
-  // Return an OSM-backed name only when the source label can be matched to a
-  // known stop. Returning the raw GTFS headsign here would prevent the
-  // per-trip OSM destination map from being used as the fallback.
+function resolveOsmStopMatch(value, stops = stopsData, preferredStopId = '') {
   const matches = findStopsMatchingName(value, stops);
-  for (const stop of matches) {
-    for (const field of ['osm_full_name_bg', 'osm_stop_name', 'osm_name', 'name', 'stop_name', 'gtfs_stop_name']) {
-      const candidate = normalizeText(stop?.[field]);
-      if (candidate) return candidate;
+  if (!matches.length) return null;
+
+  const preferred = normalizeText(preferredStopId);
+  if (preferred) {
+    const preferredMatch = matches.find(stop =>
+      normalizeText(stop?.stop_id) === preferred
+      || normalizeText(stop?.stop_code) === preferred
+    );
+    if (preferredMatch) {
+      return {
+        stopId: getStopIdentifierValue(preferredMatch),
+        name: getOsmStopName(preferredMatch),
+        stop: preferredMatch
+      };
     }
+  }
+
+  const osmMatches = matches.filter(stop => getOsmStopName(stop));
+  if (!osmMatches.length) {
+    const ids = [...new Set(matches.map(getStopIdentifierValue).filter(Boolean))];
+    return ids.length === 1
+      ? { stopId: ids[0], name: '', stop: matches[0] }
+      : null;
+  }
+
+  const distinctOsmNames = new Map();
+  for (const stop of osmMatches) {
+    const name = getOsmStopName(stop);
+    const key = normalizeStopName(name);
+    if (key && !distinctOsmNames.has(key)) distinctOsmNames.set(key, { name, stop });
+  }
+
+  // A GTFS alias can point to several unrelated physical stops. Use its OSM
+  // label only when that label is unambiguous; otherwise fall back to the
+  // trip-specific terminal mapping instead of choosing an arbitrary stop.
+  if (distinctOsmNames.size !== 1) return null;
+
+  const resolved = [...distinctOsmNames.values()][0];
+  const ids = [...new Set(osmMatches
+    .filter(stop => normalizeStopName(getOsmStopName(stop)) === normalizeStopName(resolved.name))
+    .map(getStopIdentifierValue)
+    .filter(Boolean))];
+
+  return {
+    stopId: ids.length === 1 ? ids[0] : '',
+    name: resolved.name,
+    stop: resolved.stop
+  };
+}
+
+function resolveOsmDestinationName(value, stops = stopsData, preferredStopId = '') {
+  return resolveOsmStopMatch(value, stops, preferredStopId)?.name || '';
+}
+
+function resolveOsmDestinationByStopId(stopId, stops = stopsData) {
+  const matches = findStopsMatchingIdentifier(stopId, stops);
+  for (const stop of matches) {
+    const name = getOsmStopName(stop);
+    if (name) return name;
   }
   return '';
 }
@@ -166,26 +259,27 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     seen.add(arrivalId);
 
     const terminal = tripId ? destinationLookup[tripId] : null;
-    const terminalStopId = normalizeText(arrival.terminalStopId || arrival.terminal_stop_id || terminal?.terminal_stop_id);
+    const mappedTerminalStopId = normalizeText(
+      arrival.terminalStopId || arrival.terminal_stop_id || terminal?.terminal_stop_id
+    );
     const realtimeDestinationCandidates = isRealtime
       ? [arrival.headsign, arrival.destination, arrival.stopHeadsign].map(normalizeText).filter(Boolean)
       : [];
+    const realtimeStopMatches = realtimeDestinationCandidates
+      .map(candidate => resolveOsmStopMatch(candidate, stops, mappedTerminalStopId))
+      .filter(Boolean);
     const realtimeDestinationMatches = realtimeDestinationCandidates.some(candidate =>
       destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
     );
-    const realtimeDestinationMatchesKnownStop = realtimeDestinationCandidates.some(candidate =>
-      findStopsMatchingName(candidate, stops).length > 0
-    );
+    const realtimeDestinationMatchesKnownStop = realtimeStopMatches.length > 0;
     const staticTerminalMatches = Boolean(
-      (terminalStopId && stopAliases.has(terminalStopId))
+      (mappedTerminalStopId && stopAliases.has(mappedTerminalStopId))
       || destinationMatchesBoardStop(terminal?.destination || arrival.destination, '', stopAliases, stopNames)
     );
 
     // A recognized RT headsign identifies this particular trip instance and
-    // takes precedence over a full-route terminal. If the RT label is not
-    // present in the stop-name catalog, fall back to the per-trip OSM terminal
-    // mapping so a headsign formatting difference cannot disable terminal
-    // filtering. Scheduled rows use their own generated trip terminal.
+    // takes precedence over the static full-route terminal (short turns).
+    // If it cannot be resolved to a stop, use the trip-specific GTFS/OSM map.
     const destinationIsBoardStop = realtimeDestinationCandidates.length
       ? (realtimeDestinationMatches || (!realtimeDestinationMatchesKnownStop && staticTerminalMatches))
       : staticTerminalMatches;
@@ -194,19 +288,45 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     // complete course (line, destination and all its times) for both sources.
     if (destinationIsBoardStop) continue;
 
-    const realtimeDestination = realtimeDestinationCandidates
-      .map(candidate => resolveOsmDestinationName(candidate, stops))
-      .find(Boolean) || '';
-    const scheduledOrMappedDestination = resolveOsmDestinationName(
+    const realtimeStopMatch = realtimeStopMatches.find(match => match.name)
+      || realtimeStopMatches[0]
+      || null;
+    const terminalStopId = normalizeText(realtimeStopMatch?.stopId || mappedTerminalStopId);
+    const realtimeDestination = realtimeStopMatches.map(match => match.name).find(Boolean) || '';
+    const terminalOsmDestination = resolveOsmDestinationByStopId(terminalStopId, stops);
+    const mappedOsmDestination = resolveOsmDestinationName(
       terminal?.destination || arrival.destination,
-      stops
+      stops,
+      terminalStopId
     );
+    const arrivalOsmDestination = resolveOsmDestinationName(
+      arrival.destination || arrival.headsign,
+      stops,
+      terminalStopId
+    );
+
+    // Prefer actual OSM stop data by the resolved terminal ID. The trip map
+    // is also OSM-first; raw GTFS headsigns are the final fallback only when
+    // no OSM name exists for that destination.
     const destination = realtimeDestination
+      || terminalOsmDestination
+      || mappedOsmDestination
+      || arrivalOsmDestination
       || normalizeText(terminal?.destination)
-      || scheduledOrMappedDestination
       || normalizeText(arrival.destination)
       || normalizeText(arrival.headsign);
-    const groupKey = `${routeId}|${destination}`;
+    // Group by the public-facing destination label rather than GTFS platform
+    // identifiers. One OSM destination can have several physical stop IDs
+    // (and RT/static feeds can use different ID namespaces); grouping by those
+    // IDs split one line/direction into multiple rows with only one or two
+    // times each. The destination above is already OSM-first. A genuine RT
+    // short-turn gets its own group because its resolved OSM destination differs
+    // from the full-route terminal.
+    const groupEndpoint = normalizeStopName(destination)
+      || terminalStopId
+      || normalizeText(arrival.destination)
+      || normalizeText(arrival.headsign);
+    const groupKey = `${routeId}|${groupEndpoint}`;
     if (!groups.has(groupKey)) {
       groups.set(groupKey, {
         route_id: routeId,
@@ -345,6 +465,12 @@ function buildMetroScheduleRoutes(stopIdentifier, options = {}) {
   if (nowParts.hour < 4) {
     serviceDates.push({ dateKey: dateKeyOffset(nowParts.dateKey, -1), previousDay: true });
   }
+  // The six-hour horizon can cross midnight. Include next day's regular service
+  // rows as well, otherwise low-frequency lines may stop after their second time.
+  const horizonDateKey = localDateParts(nowMs + MAX_LOOKAHEAD_SECONDS * 1000).dateKey;
+  if (horizonDateKey !== nowParts.dateKey) {
+    serviceDates.push({ dateKey: horizonDateKey, previousDay: false });
+  }
 
   const output = [];
   for (const match of matchingDirections) {
@@ -438,7 +564,7 @@ async function fetchProxyArrivals(stopIdentifier, options = {}) {
     `/api/stops/${encodeURIComponent(stopIdentifier)}/arrivals`,
     proxyBaseUrl
   );
-  url.searchParams.set('limit', '100');
+  url.searchParams.set('limit', '1000');
 
   const fetchImpl = options.fetchImpl || fetch;
   const response = await fetchImpl(url, {
@@ -525,9 +651,6 @@ async function handler(req, res) {
         sum + route.times.filter(time => time.source === 'realtime').length, 0),
       scheduled_count: Number(proxyPayload.scheduledCount) || routes.reduce((sum, route) =>
         sum + route.times.filter(time => time.source === 'schedule').length, 0),
-      scheduled_candidate_count: Number(proxyPayload.scheduledCandidateCount) || 0,
-      scheduled_merged_count: Number(proxyPayload.scheduledMergedCount) || 0,
-      schedule_generated_at: proxyPayload.scheduleGeneratedAt || null,
       provider: 'Sofia Traffic GTFS-RT + GTFS timetable',
       routes
     });
@@ -556,6 +679,7 @@ async function handler(req, res) {
 module.exports = handler;
 module.exports.mapRealtimeArrivalsToBoard = mapRealtimeArrivalsToBoard;
 module.exports.resolveOsmDestinationName = resolveOsmDestinationName;
+module.exports.resolveOsmDestinationByStopId = resolveOsmDestinationByStopId;
 module.exports.buildMetroScheduleRoutes = buildMetroScheduleRoutes;
 module.exports.getStopAliases = getStopAliases;
 module.exports.fetchProxyArrivals = fetchProxyArrivals;

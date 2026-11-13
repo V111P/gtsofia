@@ -1,5 +1,5 @@
 /** Pure mapper for explicit GTFS-RT TripUpdate events; schedule fallback is merged separately. */
-const MAX_ARRIVALS_PER_REQUEST = 100;
+const MAX_ARRIVALS_PER_REQUEST = 1000;
 const PAST_GRACE_MS = 60_000;
 
 function getEvent(stu) {
@@ -18,7 +18,7 @@ export function extractRealtimeArrivals(entities, stopIds, options = {}) {
   const limitValue = Number.parseInt(options.limit, 10);
   const limit = Number.isFinite(limitValue)
     ? Math.min(Math.max(limitValue, 1), MAX_ARRIVALS_PER_REQUEST)
-    : 20;
+    : MAX_ARRIVALS_PER_REQUEST;
   const tripLookup = options.tripLookup || Object.create(null);
   const wantedStopIds = new Set((Array.isArray(stopIds) ? stopIds : []).map(String));
   const predictions = [];

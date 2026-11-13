@@ -393,24 +393,10 @@
       loaded_at: Date.now() / 1000
     };
 
-    // Arrival sources are selected server-side: surface transport uses explicit
-    // RT events, while metro uses clearly labelled official timetable rows.
-    normalized.routes = normalized.routes
-      .map(route => {
-        const isMetro = route?.meta?.type === 'metro';
-        const times = (Array.isArray(route?.times) ? route.times : [])
-          .filter(time => isMetro
-            ? time?.source === 'schedule' || time?.scheduled === true
-            : time?.source === 'realtime' || time?.realtime === true)
-          .map(time => ({
-            ...time,
-            scheduled: isMetro,
-            source: isMetro ? 'schedule' : 'realtime',
-            realtime: !isMetro
-          }));
-        return { ...route, realtime: !isMetro, scheduled: isMetro, times };
-      })
-      .filter(route => route.times.length > 0);
+    // Preserve source flags from the server. Surface transport can now contain
+    // RT events and per-stop timetable fallback in the same direction; metro
+    // remains schedule-only.
+    normalized.routes = window.GTSofiaVirtualBoardArrivals.normalizeRoutes(normalized.routes);
     normalized.status = normalized.routes.length ? 'ok' : 'empty';
     return normalized;
   }
@@ -549,36 +535,20 @@
     ) {
       const emptyMessage = data?.board_mode === 'metro-schedule'
         ? 'Няма предстоящи метрокурсове.'
-        : 'Няма налични realtime пристигания.';
+        : 'Няма предстоящи пристигания.';
       list.innerHTML = `<div class="virtual-board-no-data">${emptyMessage}</div>`;
       return;
     }
 
-    const rows = sortBoardRoutesByNextArrival(data.routes.map(route => {
-      const isMetro = route?.meta?.type === 'metro';
-      const times = (Array.isArray(route?.times) ? route.times : []).filter(time => isMetro
-        ? time?.source === 'schedule' || time?.scheduled === true
-        : time?.source === 'realtime' || time?.realtime === true);
-      return {
-        ...route,
-        realtime: !isMetro,
-        scheduled: isMetro,
-        times: times.map(time => ({
-          ...time,
-          scheduled: isMetro,
-          realtime: !isMetro,
-          source: isMetro ? 'schedule' : 'realtime'
-        }))
-      };
-    }).filter(route =>
-      route.times.length
-      && Boolean(String(route.destination || route.headsign || '').trim())
-    ));
+    const rows = sortBoardRoutesByNextArrival(
+      window.GTSofiaVirtualBoardArrivals.normalizeRoutes(data.routes)
+        .filter(route => Boolean(String(route.destination || route.headsign || '').trim()))
+    );
 
     if (!rows.length) {
       const emptyMessage = data?.board_mode === 'metro-schedule'
         ? 'Няма предстоящи метрокурсове.'
-        : 'Няма налични realtime пристигания.';
+        : 'Няма предстоящи пристигания.';
       list.innerHTML = `<div class="virtual-board-no-data">${emptyMessage}</div>`;
 
       return;
@@ -644,7 +614,7 @@
               <div class="vb-time-block">
                 ${countdownHtml(
                   arrivals[0],
-                  !arrivals[0]?.scheduled,
+                  arrivals[0]?.realtime === true,
                   snapshotSeconds
                 )}
                 ${
