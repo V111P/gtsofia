@@ -386,12 +386,12 @@
 
       const matchingCourses = currentCourses.filter(course => sameArrivalTrip(identity, course));
       if (matchingCourses.length) {
-        // A later-stop prediction alone is not proof that the vehicle has
-        // passed the selected stop. The server marks downstream-passed only
-        // after the predicted time at a later stop has elapsed. If duplicate
-        // descriptors exist, all of them must agree before retiring the trip.
+        // If multiple descriptors describe the same physical course, any
+        // target/upstream/unknown state takes precedence over a downstream-only
+        // descriptor. This prevents duplicate raw-route + TripUpdate records
+        // from falsely marking a course as already past the selected stop.
         const passedSelectedStop = matchingCourses.every(
-          course => course.stop_update_state === 'downstream-passed'
+          course => course.stop_update_state === 'downstream-only'
         );
         if (!passedSelectedStop) {
           const alreadyConfirmedPassed = item?.passed_at !== null
@@ -410,9 +410,10 @@
         }
 
         // If this exact course was previously shown realtime at the selected
-        // stop, and a fresh TripUpdate confirms that a later stop's predicted
-        // time has elapsed, preserve that passage even if a later snapshot
-        // briefly reintroduces an older target-stop update.
+        // stop, and the fresh TripUpdate now carries timed updates only for
+        // downstream stops, the feed has advanced beyond this stop. This is
+        // strong, monotonic evidence of passage: preserve it even if a later
+        // snapshot briefly reintroduces an older target-stop update.
         const previousPassedAt = item?.passed_at === null || item?.passed_at === undefined
           ? null
           : Number(item.passed_at);
@@ -423,7 +424,7 @@
         return {
           ...item,
           passed_at: confirmedPassedAt,
-          passed_reason: item?.passed_reason || 'downstream-passed',
+          passed_reason: item?.passed_reason || 'downstream-only',
           missing_from_realtime_at: item?.missing_from_realtime_at ?? nowSeconds
         };
       }
@@ -442,9 +443,8 @@
       // previously displayed realtime at this exact stop. The vehicle may
       // have passed earlier than its last ETA, so waiting for that ETA would
       // resurrect the later GTFS timetable time. A descriptor with NO_DATA,
-      // unknown coverage, a future downstream-only update, or an upstream/target
-      // update is retained as present; only a vanished descriptor or a confirmed
-      // downstream-passed state retires it.
+      // unknown coverage, or an upstream/target update is retained as present;
+      // only a vanished descriptor or downstream-only progression retires it.
       changed = true;
       return { ...item, missing_from_realtime_at: nowSeconds };
     });
@@ -458,63 +458,27 @@
     let removedAny = false;
     const routes = (Array.isArray(boardData?.routes) ? boardData.routes : [])
       .map(route => {
-        // Build on the source array's realm (important for embedded/tested
-        // contexts where API data can originate outside this script's realm).
-        const sourceTimes = Array.isArray(route?.times) ? route.times : [];
-        const times = sourceTimes.slice(0, 0);
-        for (const time of sourceTimes) {
-          if (time?.scheduled !== true) {
-            times.push(time);
-            continue;
-          }
+        const times = (Array.isArray(route?.times) ? route.times : []).filter(time => {
+          if (time?.scheduled !== true) return true;
           const identity = getArrivalTripIdentity(route, time, stopId);
-          if (!identity) {
-            times.push(time);
-            continue;
-          }
+          if (!identity) return true;
 
-          const previousPrediction = history.find(item =>
-            sameArrivalTrip(item.identity, identity)
-          );
-          if (!previousPrediction) {
-            times.push(time);
-            continue;
-          }
-
-          const earliestTimestamp = Number(
-            previousPrediction.earliest_timestamp ?? previousPrediction.timestamp
-          );
-          const hasPassedAt = previousPrediction?.passed_at !== null
-            && previousPrediction?.passed_at !== undefined
-            && Number.isFinite(Number(previousPrediction.passed_at));
-          const disappearedFromFreshFeed = previousPrediction?.missing_from_realtime_at !== null
-            && previousPrediction?.missing_from_realtime_at !== undefined
-            && Number.isFinite(Number(previousPrediction.missing_from_realtime_at));
-          const hasReachedLastRealtimePrediction = Number.isFinite(earliestTimestamp)
-            && earliestTimestamp <= nowSeconds;
-
-          if (hasPassedAt || disappearedFromFreshFeed || hasReachedLastRealtimePrediction) {
-            removedAny = true;
-            continue;
-          }
-
-          // If the feed temporarily stops reporting this stop but still
-          // carries the course at later stops, keep the last known realtime
-          // prediction instead of replacing it with a later GTFS time (or
-          // dropping the course entirely). The history is retired once that
-          // prediction has elapsed or the fresh feed confirms passage.
-          const rememberedTimestamp = Number(previousPrediction.timestamp);
-          if (Number.isFinite(rememberedTimestamp)) {
-            times.push({
-              ...time,
-              timestamp: rememberedTimestamp,
-              scheduled: false,
-              source: 'realtime-history'
-            });
-          } else {
-            times.push(time);
-          }
-        }
+          const wasPredictedRealtime = history.some(item => {
+            if (!sameArrivalTrip(item.identity, identity)) return false;
+            const earliestTimestamp = Number(item.earliest_timestamp ?? item.timestamp);
+            const hasPassedAt = item?.passed_at !== null
+              && item?.passed_at !== undefined
+              && Number.isFinite(Number(item.passed_at));
+            const disappearedFromFreshFeed = item?.missing_from_realtime_at !== null
+              && item?.missing_from_realtime_at !== undefined
+              && Number.isFinite(Number(item.missing_from_realtime_at));
+            return hasPassedAt
+              || disappearedFromFreshFeed
+              || (Number.isFinite(earliestTimestamp) && earliestTimestamp <= nowSeconds);
+          });
+          if (wasPredictedRealtime) removedAny = true;
+          return !wasPredictedRealtime;
+        });
         return { ...route, times };
       })
       .filter(route => route.times.length > 0);

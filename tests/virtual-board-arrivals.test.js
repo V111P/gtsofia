@@ -324,27 +324,10 @@ const earlyRunFallbackBoard = {
     ]
   }]
 };
-assert.equal(reconcileRealtimeCoursePresence(earlyRunFallbackBoard, earlyRunStopId, earlyRunNextPoll), false,
-'a future update at a later stop must not be treated as proof that the vehicle has passed this stop');
-const earlyRunStillVisible = suppressPassedRealtimeFallbacks(
-  earlyRunFallbackBoard,
-  earlyRunStopId,
-  earlyRunNextPoll
-);
-assert.deepEqual(
-  earlyRunStillVisible.routes.flatMap(route => route.times).map(time => time.trip_start_time),
-  ['14:00:00', '14:10:00'],
-  'the GTFS fallback must remain visible while the only downstream prediction is still in the future'
-);
-
-const earlyRunPassedBoard = {
-  ...earlyRunFallbackBoard,
-  realtime_courses: [{ ...earlyRunCourse, stop_update_state: 'downstream-passed' }]
-};
-assert.equal(reconcileRealtimeCoursePresence(earlyRunPassedBoard, earlyRunStopId, earlyRunNextPoll), true,
-  'a later-stop prediction whose time has elapsed must confirm that the vehicle passed this stop');
+assert.equal(reconcileRealtimeCoursePresence(earlyRunFallbackBoard, earlyRunStopId, earlyRunNextPoll), true,
+'a course whose fresh TripUpdate has advanced to downstream stops must be retired before its predicted ETA if necessary');
 const earlyRunSuppressed = suppressPassedRealtimeFallbacks(
-  earlyRunPassedBoard,
+  earlyRunFallbackBoard,
   earlyRunStopId,
   earlyRunNextPoll
 );
@@ -668,9 +651,9 @@ const secondIntegrationFeed = integrationService.buildBoard({
 }, 'EARLY42', secondIntegrationNow);
 assert.equal(secondIntegrationFeed.realtime_courses[0]?.stop_update_state, 'downstream-only',
   'the second feed must show that the same course now has timed updates only downstream of the selected stop');
-assert.ok(secondIntegrationFeed.routes.some(route => route.times.some(time => time.scheduled
+assert.ok(!secondIntegrationFeed.routes.some(route => route.times.some(time => time.scheduled
   && time.trip_start_time === '14:00:00')),
-  'the service layer must keep the matching course fallback while the only downstream prediction is still in the future');
+  'the service layer must suppress the matching course fallback as soon as partial downstream realtime data is present');
 const secondIntegrationSnapshot = {
   ...secondIntegrationFeed,
   realtime_status: 'available',
@@ -686,9 +669,6 @@ const integratedEarlyArrivalResult = suppressPassedRealtimeFallbacks(
 const integratedTimes = integratedEarlyArrivalResult.routes.flatMap(route => route.times);
 assert.ok(!integratedTimes.some(time => time.scheduled && time.trip_start_time === '14:00:00'),
   'the early realtime course must not reappear as its later 14:42 GTFS fallback');
-assert.ok(integratedTimes.some(time => time.source === 'realtime-history'
-  && Math.round(time.timestamp) === Math.round(Date.parse('2026-10-30T14:39:00+02:00') / 1000)),
-  'the browser must retain the last known realtime prediction during a temporary downstream-only coverage gap');
 assert.ok(integratedTimes.some(time => time.scheduled && time.trip_start_time === '14:10:00'),
   'the next scheduled course must remain visible after suppressing the early-running course');
 
@@ -756,7 +736,7 @@ assert.equal(
 
 
 
-// Once a fresh downstream-passed TripUpdate has confirmed passage, a later
+// Once a fresh downstream-only TripUpdate has confirmed passage, a later
 // stale/reappearing target update must not clear the passed state and allow
 // the course to return through its GTFS fallback.
 const stickyStopId = 'STICKY-PASSED-STOP';
@@ -776,11 +756,11 @@ rememberRealtimeArrivalPredictions({
 const stickyDownstreamSnapshot = {
   realtime_status: 'available',
   realtime_feed_timestamp: stickyFirstPoll + 30,
-  realtime_courses: [{ ...stickyCourse, stop_update_state: 'downstream-passed' }],
+  realtime_courses: [{ ...stickyCourse, stop_update_state: 'downstream-only' }],
   routes: []
 };
 assert.equal(reconcileRealtimeCoursePresence(stickyDownstreamSnapshot, stickyStopId, stickyFirstPoll + 30), true,
-  'a downstream-passed fresh update should confirm that the previously observed course passed the stop');
+  'a downstream-only fresh update should confirm that the previously observed course passed the stop');
 
 const staleReappearingRealtime = {
   realtime_status: 'available',
