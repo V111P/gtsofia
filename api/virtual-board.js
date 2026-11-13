@@ -1,7 +1,10 @@
 const routesData = require('../data/routes.json');
 const stopsData = require('../data/stops.json');
+const tripDestinations = require('../data/trip-destinations.json');
+const metroBoardData = require('../data/metro-board.json');
 const { getRouteMetadata } = require('../route-metadata');
 
+const SOFIA_TIME_ZONE = 'Europe/Sofia';
 const PROXY_TIMEOUT_MS = 40_000;
 const MAX_ARRIVALS_PER_LINE = 3;
 const MAX_LOOKAHEAD_SECONDS = 2 * 60 * 60;
@@ -13,6 +16,22 @@ const routesById = new Map(
 
 function normalizeText(value) {
   return String(value ?? '').trim();
+}
+
+function getStopAliases(identifier, stops = stopsData) {
+  const requested = normalizeText(identifier);
+  const aliases = new Set(requested ? [requested] : []);
+  if (!requested) return aliases;
+
+  for (const stop of Array.isArray(stops) ? stops : []) {
+    const stopId = normalizeText(stop?.stop_id);
+    const stopCode = normalizeText(stop?.stop_code);
+    if (stopId === requested || stopCode === requested) {
+      if (stopId) aliases.add(stopId);
+      if (stopCode) aliases.add(stopCode);
+    }
+  }
+  return aliases;
 }
 
 function getRouteForArrival(arrival) {
@@ -38,6 +57,10 @@ function getRouteForArrival(arrival) {
 
 function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
   const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const stopAliases = options.stopAliases instanceof Set
+    ? options.stopAliases
+    : getStopAliases(options.stopIdentifier);
+  const destinationLookup = options.tripDestinations || tripDestinations;
   const groups = new Map();
   const seen = new Set();
 
@@ -51,15 +74,25 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     if (timestampMs > nowMs + MAX_LOOKAHEAD_SECONDS * 1000) continue;
 
     const route = getRouteForArrival(arrival);
+    const meta = getRouteMetadata(route);
+    // Metro is displayed from its official timetable, not from the RT feed.
+    if (meta?.type === 'metro') continue;
+
     const routeId = normalizeText(route.route_id);
     const routeNumber = normalizeText(route.route_short_name);
-    const destination = normalizeText(arrival.headsign || arrival.destination || arrival.stopHeadsign);
+    const tripId = normalizeText(arrival.tripId || arrival.trip_id);
     if (!routeId || !routeNumber) continue;
 
     const arrivalId = normalizeText(arrival.id)
-      || `${normalizeText(arrival.tripId || arrival.trip_id)}|${routeId}|${timestampMs}`;
+      || `${tripId}|${routeId}|${timestampMs}`;
     if (seen.has(arrivalId)) continue;
     seen.add(arrivalId);
+
+    const terminal = tripId ? destinationLookup[tripId] : null;
+    const terminalStopId = normalizeText(terminal?.terminal_stop_id);
+    const destination = terminalStopId && stopAliases.has(terminalStopId)
+      ? ''
+      : normalizeText(terminal?.destination || arrival.headsign || arrival.destination || arrival.stopHeadsign);
 
     const groupKey = `${routeId}|${destination}`;
     if (!groups.has(groupKey)) {
@@ -68,8 +101,9 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
         route_ref: routeNumber,
         destination,
         headsign: destination,
-        meta: getRouteMetadata(route),
+        meta,
         realtime: true,
+        scheduled: false,
         times: []
       });
     }
@@ -86,8 +120,8 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
       source: 'realtime',
       realtime: true,
       route_id: routeId,
-      trip_id: normalizeText(arrival.tripId || arrival.trip_id),
-      realtime_trip_id: normalizeText(arrival.tripId || arrival.trip_id),
+      trip_id: tripId,
+      realtime_trip_id: tripId,
       arrival_id: arrivalId
     });
   }
@@ -101,6 +135,165 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
     }))
     .filter(route => route.times.length > 0)
     .sort((left, right) => left.times[0].timestamp - right.times[0].timestamp);
+}
+
+function localDateParts(timestampMs) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: SOFIA_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(new Date(timestampMs));
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+    second: Number(values.second),
+    dateKey: `${values.year}-${values.month}-${values.day}`
+  };
+}
+
+function getSofiaUtcOffsetMinutes(timestampMs) {
+  const value = new Intl.DateTimeFormat('en-US', {
+    timeZone: SOFIA_TIME_ZONE,
+    timeZoneName: 'shortOffset'
+  }).formatToParts(new Date(timestampMs)).find(part => part.type === 'timeZoneName')?.value || 'GMT+2';
+  const match = /^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(value);
+  if (!match) return 120;
+  const minutes = Number(match[2]) * 60 + Number(match[3] || 0);
+  return match[1] === '-' ? -minutes : minutes;
+}
+
+function parseGtfsTime(value) {
+  const match = /^(\d+):(\d{2})(?::(\d{2}))?$/.exec(normalizeText(value));
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3] || 0);
+  if (minutes > 59 || seconds > 59) return null;
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function dateKeyOffset(dateKey, days) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+}
+
+function getMetroDayType(dateKey, calendar = metroBoardData.calendar) {
+  const configured = calendar?.dateTypes?.[dateKey] || calendar?.dateOverrides?.[dateKey];
+  if (configured === 'weekday' || configured === 'weekend') return configured;
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  return weekday === 0 || weekday === 6 ? 'weekend' : 'weekday';
+}
+
+function scheduledTimeToEpoch(dateKey, seconds) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const localAsUtc = Date.UTC(year, month - 1, day) + seconds * 1000;
+  const offsetMinutes = getSofiaUtcOffsetMinutes(localAsUtc);
+  return localAsUtc - offsetMinutes * 60_000;
+}
+
+function buildMetroScheduleRoutes(stopIdentifier, options = {}) {
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const metroData = options.metroData || metroBoardData;
+  const stops = options.stops || stopsData;
+  const aliases = options.stopAliases instanceof Set
+    ? options.stopAliases
+    : getStopAliases(stopIdentifier, stops);
+  const matchingDirections = [];
+
+  if (!aliases.size) return { isMetroStation: false, routes: [] };
+
+  for (const route of Object.values(metroData?.routes || {})) {
+    for (const [directionKey, direction] of Object.entries(route?.directions || {})) {
+      const stopIndex = (direction.stop_ids || []).findIndex(stopId => aliases.has(String(stopId)));
+      if (stopIndex >= 0) matchingDirections.push({ route, directionKey, direction, stopIndex });
+    }
+  }
+
+  if (!matchingDirections.length) return { isMetroStation: false, routes: [] };
+
+  const nowParts = localDateParts(nowMs);
+  const serviceDates = [{ dateKey: nowParts.dateKey, previousDay: false }];
+  // GTFS may encode after-midnight service against the previous service date (24:xx).
+  if (nowParts.hour < 4) {
+    serviceDates.push({ dateKey: dateKeyOffset(nowParts.dateKey, -1), previousDay: true });
+  }
+
+  const output = [];
+  for (const match of matchingDirections) {
+    const { route, direction, directionKey, stopIndex } = match;
+    const metaRoute = routesById.get(route.route_id) || {
+      route_id: route.route_id,
+      route_short_name: route.route_short_name,
+      route_type: route.route_type,
+      route_color: route.route_color,
+      route_text_color: route.route_text_color
+    };
+    const meta = getRouteMetadata(metaRoute);
+    const terminalStopId = normalizeText(direction.terminal_stop_id);
+    const destination = terminalStopId && aliases.has(terminalStopId)
+      ? ''
+      : normalizeText(direction.destination);
+    const times = [];
+
+    for (const serviceDate of serviceDates) {
+      const dayType = getMetroDayType(serviceDate.dateKey, metroData.calendar);
+      const courses = Array.isArray(direction[dayType]) ? direction[dayType] : [];
+
+      for (const course of courses) {
+        const timeText = course?.times?.[stopIndex];
+        const seconds = parseGtfsTime(timeText);
+        if (seconds === null) continue;
+        if (serviceDate.previousDay && seconds < 24 * 60 * 60) continue;
+
+        const timestampMs = scheduledTimeToEpoch(serviceDate.dateKey, seconds);
+        if (timestampMs < nowMs - PAST_GRACE_MS) continue;
+        if (timestampMs > nowMs + MAX_LOOKAHEAD_SECONDS * 1000) continue;
+
+        const tripId = normalizeText(course.original_trip_id);
+        times.push({
+          timestamp: Math.floor(timestampMs / 1000),
+          delay: null,
+          scheduled: true,
+          source: 'schedule',
+          realtime: false,
+          route_id: route.route_id,
+          trip_id: tripId,
+          arrival_id: `${route.route_id}|${directionKey}|${tripId}|${timestampMs}`
+        });
+      }
+    }
+
+    times.sort((left, right) => left.timestamp - right.timestamp);
+    const uniqueTimes = [...new Map(times.map(time => [time.arrival_id, time])).values()]
+      .slice(0, MAX_ARRIVALS_PER_LINE);
+    if (!uniqueTimes.length) continue;
+
+    output.push({
+      route_id: route.route_id,
+      route_ref: normalizeText(route.route_short_name) || route.route_id,
+      destination,
+      headsign: destination,
+      meta,
+      realtime: false,
+      scheduled: true,
+      direction_key: directionKey,
+      times: uniqueTimes
+    });
+  }
+
+  output.sort((left, right) => left.times[0].timestamp - right.times[0].timestamp);
+  return { isMetroStation: true, routes: output };
 }
 
 function setHeaders(res) {
@@ -166,14 +359,37 @@ async function handler(req, res) {
   const nowMs = Date.now();
   const refreshedAt = Math.floor(nowMs / 1000);
 
+  // Metro has no usable RT feed. Its virtual-board rows come from the
+  // published metro timetable and are explicitly marked as scheduled.
+  const metroBoard = buildMetroScheduleRoutes(stopIdentifier, { nowMs });
+  if (metroBoard.isMetroStation) {
+    const routes = metroBoard.routes;
+    return res.status(200).json({
+      status: routes.length ? 'ok' : 'empty',
+      board_mode: 'metro-schedule',
+      stop_code: stopIdentifier,
+      stop_identifier: stopIdentifier,
+      generated_at: refreshedAt,
+      refreshed_at: refreshedAt,
+      realtime_status: 'not_applicable',
+      realtime_message: 'Метролиниите се показват по официалното разписание; няма realtime данни.',
+      provider: 'GT Sofia official GTFS timetable',
+      realtime_only: false,
+      routes
+    });
+  }
 
   try {
     const proxyPayload = await fetchProxyArrivals(stopIdentifier);
-    const routes = mapRealtimeArrivalsToBoard(proxyPayload.arrivals, { nowMs });
+    const routes = mapRealtimeArrivalsToBoard(proxyPayload.arrivals, {
+      nowMs,
+      stopIdentifier
+    });
     const feedTimestamp = Number(proxyPayload.feedTimestamp);
 
     return res.status(200).json({
       status: routes.length ? 'ok' : 'empty',
+      board_mode: 'realtime',
       stop_code: stopIdentifier,
       stop_identifier: stopIdentifier,
       generated_at: Number.isFinite(feedTimestamp) && feedTimestamp > 0 ? feedTimestamp : null,
@@ -194,6 +410,7 @@ async function handler(req, res) {
 
     return res.status(statusCode).json({
       status: 'empty',
+      board_mode: 'realtime',
       stop_code: stopIdentifier,
       stop_identifier: stopIdentifier,
       generated_at: null,
@@ -209,4 +426,6 @@ async function handler(req, res) {
 
 module.exports = handler;
 module.exports.mapRealtimeArrivalsToBoard = mapRealtimeArrivalsToBoard;
+module.exports.buildMetroScheduleRoutes = buildMetroScheduleRoutes;
+module.exports.getStopAliases = getStopAliases;
 module.exports.fetchProxyArrivals = fetchProxyArrivals;

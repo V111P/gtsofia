@@ -16,24 +16,39 @@ const context = {
   Date
 };
 context.globalThis = context;
-vm.runInNewContext(source, context, { filename: sourcePath });
+const testExposure = `
+  globalThis.__testInternals = {
+    formatArrivalCountdown,
+    sortBoardRoutesByNextArrival,
+    getBoardAutoRefreshDelay,
+    recordBoardRefreshOutcome
+  };
+`;
+const closing = '})();';
+const closingIndex = source.lastIndexOf(closing);
+assert.notEqual(closingIndex, -1, 'virtual board module should have a single IIFE closing');
+const instrumentedSource = source.slice(0, closingIndex)
+  + testExposure
+  + source.slice(closingIndex);
+vm.runInNewContext(instrumentedSource, context, { filename: sourcePath });
 
 const {
   formatArrivalCountdown,
   sortBoardRoutesByNextArrival,
   getBoardAutoRefreshDelay,
   recordBoardRefreshOutcome
-} = context.__gtsofiaVirtualBoardTestInternals;
+} = context.__testInternals;
 
 const now = 1_000;
 for (const [offset, expected] of [
   [60, '1 мин.'],
   [59, '1 мин.'],
   [30, '1 мин.'],
-  [29, '0 мин.'],
+  [29, '1 мин.'],
   [0, '0 мин.'],
   [120, '2 мин.'],
-  [150, '3 мин.']
+  [150, '3 мин.'],
+  [121, '3 мин.']
 ]) {
   assert.equal(formatArrivalCountdown(now + offset, now), expected);
 }
@@ -48,12 +63,20 @@ assert.deepEqual(
   'the frontend sorts provider arrivals by their actual next realtime timestamp'
 );
 
+assert.doesNotMatch(source, /__gtsofiaVirtualBoardTestInternals/,
+  'the browser bundle must not expose test-only internals');
 assert.doesNotMatch(source, /rememberRealtimeArrivalPredictions|reconcileRealtimeCoursePresence|suppressPassedRealtimeFallbacks/,
   'the frontend must not keep or reconcile trip history to recreate board arrivals');
-assert.match(source, /filter\(time => time\?\.source === 'realtime' \|\| time\?\.realtime === true\)/,
-  'only provider-marked realtime arrivals may reach the renderer');
+assert.match(source, /time\?\.source === 'schedule' \|\| time\?\.scheduled === true/,
+  'the renderer accepts timetable rows only through the metro schedule exception');
+assert.match(source, /const isMetro = route\?\.meta\?\.type === 'metro'/,
+  'timetable arrivals are restricted to routes classified as metro');
+assert.match(source, /По разписание/,
+  'metro timetable rows are visibly labelled as scheduled');
 assert.match(source, /Няма налични realtime пристигания/,
-  'an empty realtime response must be described as an empty realtime board');
+  'an empty surface transport response must be described as an empty realtime board');
+assert.match(source, /Няма предстоящи метрокурсове по разписание/,
+  'empty metro boards must explain that the timetable contains no upcoming course');
 assert.match(source, /Never keep an old prediction visible/,
   'a failed refresh must not leave stale predictions visible');
 assert.doesNotMatch(source, /показваме последните заредени данни/i,
@@ -69,4 +92,4 @@ assert.equal(getBoardAutoRefreshDelay(), 120_000);
 recordBoardRefreshOutcome({ realtime_status: 'available' });
 assert.equal(getBoardAutoRefreshDelay(), 30_000);
 
-console.log('virtual-board-arrivals: realtime-only presentation tests passed');
+console.log('virtual-board-arrivals: realtime + metro timetable presentation tests passed');

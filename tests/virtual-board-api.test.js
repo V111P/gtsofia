@@ -63,6 +63,80 @@ assert.equal(mapped[0].times[0].source, 'realtime');
 assert.equal(mapped[0].times[0].scheduled, false);
 assert.equal(mapped[0].times[0].delay, 90);
 
+const destinationTripId = 'TM22-TM4-9-13-17666667941';
+const destinationArrival = {
+  id: 'osm-destination-test',
+  tripId: destinationTripId,
+  routeId: 'TM22',
+  routeShortName: '22',
+  routeType: '0',
+  headsign: 'OLD GTFS HEADSIGN',
+  arrivalDate,
+  isRealtime: true
+};
+const osmDestination = handler.mapRealtimeArrivalsToBoard([destinationArrival], {
+  nowMs,
+  stopIdentifier: '1247'
+});
+assert.equal(osmDestination[0].destination, 'Автостанция Изток', 'the direction endpoint should use the OSM-first terminal-stop name');
+const hiddenTerminal = handler.mapRealtimeArrivalsToBoard([destinationArrival], {
+  nowMs,
+  stopIdentifier: '2023'
+});
+assert.equal(hiddenTerminal[0].destination, '', 'do not repeat the board stop as the trip destination');
+
+const metroRealtime = handler.mapRealtimeArrivalsToBoard([{
+  id: 'metro-rt-test',
+  tripId: 'metro-rt-test',
+  routeId: 'M1',
+  routeShortName: '1',
+  routeType: '1',
+  headsign: 'Бизнес парк София',
+  arrivalDate,
+  isRealtime: true
+}], { nowMs, stopIdentifier: 'M1' });
+assert.deepEqual(metroRealtime, [], 'metro is served from its labelled timetable, not the RT adapter');
+
+const testMetroData = {
+  calendar: { dateTypes: { '2026-11-13': 'weekday' }, dateOverrides: {} },
+  routes: {
+    M1: {
+      route_id: 'M1',
+      route_short_name: '1',
+      route_type: '1',
+      route_color: '1C75BC',
+      route_text_color: 'FFFFFF',
+      directions: {
+        D1: {
+          destination: 'Бизнес парк София',
+          terminal_stop_id: 'M2',
+          stop_ids: ['M1', 'M2'],
+          weekday: [{ original_trip_id: 'metro-course-1', times: ['07:05:00', '07:07:00'] }],
+          weekend: []
+        }
+      }
+    }
+  }
+};
+const fixedMetroNow = Date.parse('2026-11-13T05:00:00.000Z'); // 07:00 in Sofia
+const metroStartBoard = handler.buildMetroScheduleRoutes('M1', {
+  nowMs: fixedMetroNow,
+  metroData: testMetroData,
+  stops: [{ stop_id: 'M1', stop_code: '1' }, { stop_id: 'M2', stop_code: '2' }]
+});
+assert.equal(metroStartBoard.isMetroStation, true);
+assert.equal(metroStartBoard.routes[0].meta.type, 'metro');
+assert.equal(metroStartBoard.routes[0].destination, 'Бизнес парк София');
+assert.equal(metroStartBoard.routes[0].times[0].source, 'schedule');
+assert.equal(metroStartBoard.routes[0].times[0].scheduled, true);
+assert.equal(metroStartBoard.routes[0].times[0].timestamp, Math.floor(Date.parse('2026-11-13T05:05:00.000Z') / 1000));
+const metroTerminalBoard = handler.buildMetroScheduleRoutes('M2', {
+  nowMs: fixedMetroNow,
+  metroData: testMetroData,
+  stops: [{ stop_id: 'M1', stop_code: '1' }, { stop_id: 'M2', stop_code: '2' }]
+});
+assert.equal(metroTerminalBoard.routes[0].destination, '', 'metro terminal name is hidden when the terminal station is already open');
+
 function makeResponse() {
   return {
     statusCode: null,
@@ -113,11 +187,17 @@ function makeResponse() {
     assert.equal(res.body.routes[0].times[0].source, 'realtime');
     assert.equal(res.body.routes[0].times[0].scheduled, false);
 
-    // Exact GTFS stop_id values (including metro IDs such as M1) are accepted.
+    // Metro stations are served from the local official timetable; they do not
+    // make an RT request to Render.
+    const urlBeforeMetro = requestedUrl;
     res = makeResponse();
     await handler({ method: 'GET', query: { stop_id: 'M1' } }, res);
     assert.equal(res.statusCode, 200);
-    assert.match(requestedUrl, /\/api\/stops\/M1\/arrivals\?limit=100$/);
+    assert.equal(res.body.board_mode, 'metro-schedule');
+    assert.equal(res.body.realtime_status, 'not_applicable');
+    assert.ok(res.body.routes.every(route => route.meta.type === 'metro'));
+    assert.ok(res.body.routes.every(route => route.times.every(time => time.source === 'schedule')));
+    assert.equal(requestedUrl, urlBeforeMetro, 'metro board must not call the realtime proxy');
 
     // An empty upstream realtime list stays empty; no timetable course is added.
     global.fetch = async () => ({ ok: true, json: async () => ({ arrivals: [], feedTimestamp: Math.floor(Date.now() / 1000) }) });

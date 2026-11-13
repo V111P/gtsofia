@@ -10,7 +10,6 @@
   let selectedStopMarker = null;
   let stopMarkersById = new Map();
   let transportData = null;
-  let lastBoardData = null;
   let boardAutoRefreshTimer = null;
   let boardAutoRefreshFailures = 0;
   let boardInitialLoadInFlight = false;
@@ -191,16 +190,15 @@
     );
   }
 
-  function destinationHtml(
-    destination
-  ) {
+  function destinationHtml(destination) {
+    const label = String(destination || '').trim();
+    if (!label) return '';
     return (
-      `<span class="schedule-summary-arrow direction-arrow"`
-      + ` aria-hidden="true">`
+      `<span class="schedule-summary-arrow direction-arrow" aria-hidden="true">`
       + `<img src="Icons/destinationarrow.svg" alt="">`
       + `</span>`
       + `<strong class="schedule-summary-destination vb-destination">`
-      + `${escapeHtml(destination || "—")}`
+      + `${escapeHtml(label)}`
       + `</strong>`
     );
   }
@@ -213,21 +211,10 @@
 
     if (!Number.isFinite(seconds)) return "";
 
-    const remainingSeconds =
-      seconds - nowSeconds;
-
-    // Minutes are calculated once from the board's load timestamp. They stay
-    // fixed until the next automatic or manual board refresh.
-    // Arrival has reached the stop.
-    if (remainingSeconds <= 0) {
-      return "0 мин.";
-    }
-
-    // Display whole minutes only, rounded to the nearest minute from the exact
-    // remaining seconds (half a minute rounds up): 9:01 -> 9 мин., 9:30 ->
-    // 10 мин. A remaining time below 30 seconds rounds to 0 мин.
-    const minutes = Math.round(remainingSeconds / 60);
-
+    // Display-only ETA: round up so a positive wait never appears as 0 min.
+    // The event timestamp from the RT/timetable source is never modified.
+    const remainingSeconds = seconds - nowSeconds;
+    const minutes = Math.max(0, Math.ceil(remainingSeconds / 60));
     return `${minutes} мин.`;
   }
 
@@ -276,22 +263,18 @@
         ? '<span class="vb-arrival-live" aria-hidden="true"></span>'
         : "";
 
-    const countdown =
-      formatArrivalCountdown(
-        timestamp,
-        snapshotSeconds
-      );
+    const countdown = formatArrivalCountdown(timestamp, snapshotSeconds);
+    const scheduleLabel = arrival?.scheduled
+      ? '<span class="vb-scheduled-label">По разписание</span>'
+      : '';
 
     return (
       `<div class="vb-arrival-main">`
       + `${live}`
-      + `<span class="vb-arrival-clock">`
-      + `${escapeHtml(clock)}`
-      + `</span>`
+      + `<span class="vb-arrival-clock">${escapeHtml(clock)}</span>`
       + `<span class="vb-arrival-separator" aria-hidden="true">·</span>`
-      + `<span class="vb-arrival-minutes">`
-      + `${escapeHtml(countdown)}`
-      + `</span>`
+      + `<span class="vb-arrival-minutes">${escapeHtml(countdown)}</span>`
+      + `${scheduleLabel}`
       + `</div>`
     );
   }
@@ -312,8 +295,8 @@
   }
 
   async function loadBoardMapData() {
-    // The map needs only stop coordinates and route patterns. Arrival times
-    // are fetched separately from the realtime-only proxy.
+    // The map needs only stop coordinates and route patterns. The board API
+    // selects the source per mode: RT for surface transport, timetable for metro.
     const [rawStops, directions] = await Promise.all([
       fetchStaticJson("data/stops.json"),
       fetchStaticJson("data/directions.json")
@@ -414,19 +397,25 @@
       loaded_at: Date.now() / 1000
     };
 
-    // The board endpoint is realtime-only. Do not merge, infer, remember,
-    // or restore trips from the local timetable in the browser.
+    // Arrival sources are selected server-side: surface transport uses explicit
+    // RT events, while metro uses clearly labelled official timetable rows.
     normalized.routes = normalized.routes
-      .map(route => ({
-        ...route,
-        realtime: true,
-        times: (Array.isArray(route?.times) ? route.times : [])
-          .filter(time => time?.source === 'realtime' || time?.realtime === true)
-          .map(time => ({ ...time, scheduled: false, source: 'realtime', realtime: true }))
-      }))
+      .map(route => {
+        const isMetro = route?.meta?.type === 'metro';
+        const times = (Array.isArray(route?.times) ? route.times : [])
+          .filter(time => isMetro
+            ? time?.source === 'schedule' || time?.scheduled === true
+            : time?.source === 'realtime' || time?.realtime === true)
+          .map(time => ({
+            ...time,
+            scheduled: isMetro,
+            source: isMetro ? 'schedule' : 'realtime',
+            realtime: !isMetro
+          }));
+        return { ...route, realtime: !isMetro, scheduled: isMetro, times };
+      })
       .filter(route => route.times.length > 0);
     normalized.status = normalized.routes.length ? 'ok' : 'empty';
-    normalized.realtime_only = true;
     return normalized;
   }
 
@@ -464,10 +453,7 @@
       return;
     }
 
-    if (data) {
-      boardAutoRefreshFailures = 0;
-      lastBoardData = data;
-    }
+    if (data) boardAutoRefreshFailures = 0;
   }
 
   function canAutoRefreshBoard() {
@@ -524,8 +510,8 @@
     if (!statusElement) return;
 
     const realtimeStatus = String(data?.realtime_status || 'available');
-    const label = realtimeStatus === 'unavailable'
-      ? (data?.realtime_message || 'Realtime временно недостъпен — не показваме времена от разписанието.')
+    const label = realtimeStatus === 'unavailable' || realtimeStatus === 'not_applicable'
+      ? (data?.realtime_message || 'Realtime информацията временно не е налична.')
       : '';
 
     if (warning) {
@@ -535,8 +521,9 @@
       return;
     }
 
+    const statusClass = realtimeStatus === 'not_applicable' ? 'is-info' : 'is-warning';
     statusElement.innerHTML = label
-      ? `<span class="vb-board-status-label is-warning">${escapeHtml(label)}</span>`
+      ? `<span class="vb-board-status-label ${statusClass}">${escapeHtml(label)}</span>`
       : '';
   }
 
@@ -558,26 +545,36 @@
       data.status !== "ok"
       || !data.routes.length
     ) {
-      list.innerHTML =
-        `<div class="virtual-board-no-data">Няма налични realtime пристигания.</div>`;
-
+      const emptyMessage = data?.board_mode === 'metro-schedule'
+        ? 'Няма предстоящи метрокурсове по разписание.'
+        : 'Няма налични realtime пристигания.';
+      list.innerHTML = `<div class="virtual-board-no-data">${emptyMessage}</div>`;
       return;
     }
 
-    // The proxy supplies realtime-only predictions. The browser only filters
-    // provider-marked RT entries, sorts the rows and renders them.
-    const rows = sortBoardRoutesByNextArrival(data.routes.filter(
-      route => Array.isArray(route?.times)
-        && route.times.some(time => time?.source === 'realtime' || time?.realtime === true)
-    ).map(route => ({
-      ...route,
-      realtime: true,
-      times: route.times.filter(time => time?.source === 'realtime' || time?.realtime === true)
-    })));
+    const rows = sortBoardRoutesByNextArrival(data.routes.map(route => {
+      const isMetro = route?.meta?.type === 'metro';
+      const times = (Array.isArray(route?.times) ? route.times : []).filter(time => isMetro
+        ? time?.source === 'schedule' || time?.scheduled === true
+        : time?.source === 'realtime' || time?.realtime === true);
+      return {
+        ...route,
+        realtime: !isMetro,
+        scheduled: isMetro,
+        times: times.map(time => ({
+          ...time,
+          scheduled: isMetro,
+          realtime: !isMetro,
+          source: isMetro ? 'schedule' : 'realtime'
+        }))
+      };
+    }).filter(route => route.times.length));
 
     if (!rows.length) {
-      list.innerHTML =
-        `<div class="virtual-board-no-data">Няма налични realtime пристигания.</div>`;
+      const emptyMessage = data?.board_mode === 'metro-schedule'
+        ? 'Няма предстоящи метрокурсове по разписание.'
+        : 'Няма налични realtime пристигания.';
+      list.innerHTML = `<div class="virtual-board-no-data">${emptyMessage}</div>`;
 
       return;
     }
@@ -676,7 +673,6 @@
       String(
         stop.stop_id
       );
-    lastBoardData = null;
 
     const panel =
       boardPanel();
@@ -741,8 +737,7 @@
 
           selectedStopId =
             null;
-          lastBoardData = null;
-
+      
           if (selectedStopMarker) {
             selectedStopMarker.setStyle(
               {
@@ -824,7 +819,6 @@
         return;
       }
 
-      lastBoardData = data;
       recordBoardRefreshOutcome(data);
       renderBoardList(
         panel,
@@ -843,7 +837,7 @@
       }
 
       console.error(
-        "Realtime virtual board error:",
+        "Virtual board error:",
         error
       );
       recordBoardRefreshOutcome(null, error);
@@ -852,7 +846,7 @@
       if (list) {
         list.innerHTML = `<div class="virtual-board-error">Таблото не може да бъде заредено. Ще опитаме отново автоматично.</div>`;
       }
-      renderBoardStatus(panel, { realtime_status: 'unavailable' }, error?.message || 'Realtime зареждането не успя');
+      renderBoardStatus(panel, { realtime_status: 'unavailable' }, error?.message || 'Зареждането на таблото не успя');
     } finally {
       if (
         renderToken
@@ -1643,7 +1637,6 @@
       const data = await fetchVirtualBoardViaServer(stop);
       if (requestToken !== boardRenderToken || selectedStopId !== requestedStopId) return;
 
-      lastBoardData = data;
       recordBoardRefreshOutcome(data);
       renderBoardList(boardPanel(), data);
     } catch (error) {
@@ -1655,9 +1648,8 @@
       const list = panel?.querySelector('.virtual-board-list');
       // Never keep an old prediction visible after an unsuccessful refresh:
       // this board intentionally has no static or stale-data fallback.
-      lastBoardData = null;
       if (list) {
-        list.innerHTML = `<div class="virtual-board-error">Realtime данните временно не могат да бъдат заредени. Няма да показваме времена от разписанието.</div>`;
+        list.innerHTML = `<div class="virtual-board-error">Данните за таблото временно не могат да бъдат заредени. Няма да показваме стари или заместващи времена.</div>`;
       }
       renderBoardStatus(
         panel,
@@ -1754,13 +1746,4 @@
     initializeVirtualBoards
   );
 
-  // Small test seam; production pages do not use this object.
-  globalThis.__gtsofiaVirtualBoardTestInternals = {
-    formatArrivalCountdown,
-    sortBoardRoutesByNextArrival,
-    getBoardAutoRefreshDelay,
-    recordBoardRefreshOutcome,
-    scheduleBoardAutoRefresh,
-    clearBoardAutoRefreshTimer
-  };
 })();
