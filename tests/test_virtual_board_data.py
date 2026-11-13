@@ -74,6 +74,37 @@ class VirtualBoardOutputTests(unittest.TestCase):
         self.assertNotIn("metro-trip", result, "metro uses its own compact timetable dataset")
         self.assertNotIn("route_id", result["tram-trip"], "route ID is already supplied by the RT event")
 
+    def test_partial_course_uses_its_own_terminal_stop(self):
+        directions = {
+            "TM22": {
+                "D1": {
+                    "stops": [
+                        {"stop_id": "0633", "osm_name": "Начална"},
+                        {"stop_id": "1247", "osm_name": "Парк Св. Св. Петър и Павел"},
+                        {"stop_id": "2023", "osm_name": "Автостанция Изток"},
+                    ]
+                },
+                "D2": {
+                    "stops": [
+                        {"stop_id": "0633", "osm_name": "Начална"},
+                        {"stop_id": "1247", "osm_name": "Парк Св. Св. Петър и Павел"},
+                        {"stop_id": "0470", "osm_name": "гара Подуяне"},
+                    ]
+                },
+            }
+        }
+        schedules = {
+            "TM22": {
+                "D1": {"weekday": [{"original_trip_id": "full-course"}]},
+                "D2": {"weekday": [{"original_trip_id": "partial-course"}]},
+            }
+        }
+
+        result = build_trip_destinations(directions, schedules, self.routes)
+        self.assertEqual(result["full-course"]["terminal_stop_id"], "2023")
+        self.assertEqual(result["partial-course"]["terminal_stop_id"], "0470")
+        self.assertEqual(result["partial-course"]["destination"], "гара Подуяне")
+
     def test_conflicting_direction_for_same_original_trip_is_rejected(self):
         schedules = {
             "TM22": {

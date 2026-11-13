@@ -264,9 +264,6 @@
         : "";
 
     const countdown = formatArrivalCountdown(timestamp, snapshotSeconds);
-    const scheduleLabel = arrival?.scheduled
-      ? '<span class="vb-scheduled-label">По разписание</span>'
-      : '';
 
     return (
       `<div class="vb-arrival-main">`
@@ -274,7 +271,6 @@
       + `<span class="vb-arrival-clock">${escapeHtml(clock)}</span>`
       + `<span class="vb-arrival-separator" aria-hidden="true">·</span>`
       + `<span class="vb-arrival-minutes">${escapeHtml(countdown)}</span>`
-      + `${scheduleLabel}`
       + `</div>`
     );
   }
@@ -510,9 +506,6 @@
     if (!statusElement) return;
 
     const realtimeStatus = String(data?.realtime_status || 'available');
-    const label = realtimeStatus === 'unavailable' || realtimeStatus === 'not_applicable'
-      ? (data?.realtime_message || 'Realtime информацията временно не е налична.')
-      : '';
 
     if (warning) {
       statusElement.innerHTML = `
@@ -521,9 +514,18 @@
       return;
     }
 
-    const statusClass = realtimeStatus === 'not_applicable' ? 'is-info' : 'is-warning';
+    // Metro uses the official timetable internally, but the board stays clean:
+    // no realtime disclaimer is shown above the arrivals.
+    if (realtimeStatus === 'not_applicable') {
+      statusElement.innerHTML = '';
+      return;
+    }
+
+    const label = realtimeStatus === 'unavailable'
+      ? (data?.realtime_message || 'Realtime информацията временно не е налична.')
+      : '';
     statusElement.innerHTML = label
-      ? `<span class="vb-board-status-label ${statusClass}">${escapeHtml(label)}</span>`
+      ? `<span class="vb-board-status-label is-warning">${escapeHtml(label)}</span>`
       : '';
   }
 
@@ -546,7 +548,7 @@
       || !data.routes.length
     ) {
       const emptyMessage = data?.board_mode === 'metro-schedule'
-        ? 'Няма предстоящи метрокурсове по разписание.'
+        ? 'Няма предстоящи метрокурсове.'
         : 'Няма налични realtime пристигания.';
       list.innerHTML = `<div class="virtual-board-no-data">${emptyMessage}</div>`;
       return;
@@ -572,7 +574,7 @@
 
     if (!rows.length) {
       const emptyMessage = data?.board_mode === 'metro-schedule'
-        ? 'Няма предстоящи метрокурсове по разписание.'
+        ? 'Няма предстоящи метрокурсове.'
         : 'Няма налични realtime пристигания.';
       list.innerHTML = `<div class="virtual-board-no-data">${emptyMessage}</div>`;
 
@@ -627,17 +629,21 @@
               )
               .join("");
 
+          const direction = String(row.destination || row.headsign || '').trim();
+          const directionRow = direction
+            ? `<div class="schedule-summary-route-row vb-route-row">`
+              + `${lineIdentityHtml(meta)}`
+              + `${destinationHtml(direction)}`
+              + `</div>`
+            : '';
+          const timeBlockClass = direction
+            ? 'vb-time-block'
+            : 'vb-time-block vb-time-block--no-direction';
+
           return `
             <article class="vb-row">
-              <div class="schedule-summary-route-row vb-route-row">
-                ${lineIdentityHtml(meta)}
-                ${destinationHtml(
-                  row.destination
-                  || row.headsign
-                  || ""
-                )}
-              </div>
-              <div class="vb-time-block">
+              ${directionRow}
+              <div class="${timeBlockClass}">
                 ${countdownHtml(
                   arrivals[0],
                   !arrivals[0]?.scheduled,

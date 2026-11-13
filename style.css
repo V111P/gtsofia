@@ -1246,6 +1246,11 @@ VIRTUAL BOARDS
   padding-left: 99px;
 }
 
+.vb-time-block--no-direction {
+  margin-top: 0;
+  padding-left: 0;
+}
+
 .vb-arrival-main {
   display: inline-flex;
   align-items: center;
@@ -1276,19 +1281,6 @@ VIRTUAL BOARDS
   color: #6b7280;
   font-size: 15px;
   font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.vb-scheduled-label {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 6px;
-  border-radius: 6px;
-  background: #eff6ff;
-  color: #1d4ed8;
-  font-size: 10px;
-  font-weight: 700;
   line-height: 1;
   white-space: nowrap;
 }

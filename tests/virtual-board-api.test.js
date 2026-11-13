@@ -85,6 +85,56 @@ const hiddenTerminal = handler.mapRealtimeArrivalsToBoard([destinationArrival], 
 });
 assert.equal(hiddenTerminal[0].destination, '', 'do not repeat the board stop as the trip destination');
 
+// Short-turn / partial courses use their own per-trip terminal mapping. When
+// that terminal is the station currently open, the direction must be hidden.
+const partialTripId = 'TM22-partial-to-poduyane';
+const partialCourse = handler.mapRealtimeArrivalsToBoard([{
+  ...destinationArrival,
+  id: 'partial-course-terminal-test',
+  tripId: partialTripId,
+  headsign: 'OLD GTFS HEADSIGN'
+}], {
+  nowMs,
+  stopIdentifier: '0470',
+  tripDestinations: {
+    [partialTripId]: {
+      terminal_stop_id: '0470',
+      destination: 'гара Подуяне'
+    }
+  }
+});
+assert.equal(partialCourse[0].destination, '', 'partial courses hide their own actual terminal when it is the open board stop');
+
+const partialHeadSignOverridesFullRoute = handler.mapRealtimeArrivalsToBoard([{
+  ...destinationArrival,
+  id: 'partial-course-headsign-overrides-static-terminal',
+  tripId: 'partial-course-with-static-full-route-map',
+  headsign: 'ГАРА ПОДУЯНЕ'
+}], {
+  nowMs,
+  stopIdentifier: '0470',
+  tripDestinations: {
+    'partial-course-with-static-full-route-map': {
+      terminal_stop_id: '2023',
+      destination: 'Автостанция Изток'
+    }
+  }
+});
+assert.equal(partialHeadSignOverridesFullRoute[0].destination, '', 'an RT partial-course headsign can override a static full-route destination for terminal hiding');
+
+// A partial course may be absent from the per-trip destination table. In that
+// case an RT headsign matching the current stop name still identifies it.
+const partialHeadsignCourse = handler.mapRealtimeArrivalsToBoard([{
+  ...destinationArrival,
+  id: 'partial-headsign-terminal-test',
+  tripId: 'unmapped-partial-course',
+  headsign: 'ГАРА ПОДУЯНЕ'
+}], {
+  nowMs,
+  stopIdentifier: '0470'
+});
+assert.equal(partialHeadsignCourse[0].destination, '', 'partial-course headsign matching the OSM/GTFS stop name hides the direction');
+
 const metroRealtime = handler.mapRealtimeArrivalsToBoard([{
   id: 'metro-rt-test',
   tripId: 'metro-rt-test',
@@ -195,6 +245,7 @@ function makeResponse() {
     assert.equal(res.statusCode, 200);
     assert.equal(res.body.board_mode, 'metro-schedule');
     assert.equal(res.body.realtime_status, 'not_applicable');
+    assert.equal(res.body.realtime_message, undefined, 'metro board response does not send a realtime disclaimer');
     assert.ok(res.body.routes.every(route => route.meta.type === 'metro'));
     assert.ok(res.body.routes.every(route => route.times.every(time => time.source === 'schedule')));
     assert.equal(requestedUrl, urlBeforeMetro, 'metro board must not call the realtime proxy');

@@ -34,6 +34,49 @@ function getStopAliases(identifier, stops = stopsData) {
   return aliases;
 }
 
+function normalizeStopName(value) {
+  return normalizeText(value)
+    .normalize('NFKC')
+    .toLocaleLowerCase('bg-BG')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+function getStopNames(identifier, stops = stopsData) {
+  const aliases = getStopAliases(identifier, stops);
+  const names = new Set();
+  if (!aliases.size) return names;
+
+  const nameFields = [
+    'osm_stop_name',
+    'osm_name',
+    'osm_full_name_bg',
+    'stop_name',
+    'gtfs_stop_name',
+    'name'
+  ];
+
+  for (const stop of Array.isArray(stops) ? stops : []) {
+    const stopId = normalizeText(stop?.stop_id);
+    const stopCode = normalizeText(stop?.stop_code);
+    if (!aliases.has(stopId) && !aliases.has(stopCode)) continue;
+
+    for (const field of nameFields) {
+      const name = normalizeStopName(stop?.[field]);
+      if (name) names.add(name);
+    }
+  }
+  return names;
+}
+
+function destinationMatchesBoardStop(destination, terminalStopId, stopAliases, stopNames) {
+  const terminalId = normalizeText(terminalStopId);
+  if (terminalId && stopAliases.has(terminalId)) return true;
+
+  const normalizedDestination = normalizeStopName(destination);
+  return Boolean(normalizedDestination && stopNames.has(normalizedDestination));
+}
+
 function getRouteForArrival(arrival) {
   const routeId = normalizeText(arrival?.routeId || arrival?.route_id);
   const routeNumber = normalizeText(arrival?.routeShortName || arrival?.route_short_name);
@@ -57,9 +100,13 @@ function getRouteForArrival(arrival) {
 
 function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
   const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const stops = Array.isArray(options.stops) ? options.stops : stopsData;
   const stopAliases = options.stopAliases instanceof Set
     ? options.stopAliases
-    : getStopAliases(options.stopIdentifier);
+    : getStopAliases(options.stopIdentifier, stops);
+  const stopNames = options.stopNames instanceof Set
+    ? options.stopNames
+    : getStopNames(options.stopIdentifier, stops);
   const destinationLookup = options.tripDestinations || tripDestinations;
   const groups = new Map();
   const seen = new Set();
@@ -90,9 +137,23 @@ function mapRealtimeArrivalsToBoard(arrivals, options = {}) {
 
     const terminal = tripId ? destinationLookup[tripId] : null;
     const terminalStopId = normalizeText(terminal?.terminal_stop_id);
-    const destination = terminalStopId && stopAliases.has(terminalStopId)
-      ? ''
-      : normalizeText(terminal?.destination || arrival.headsign || arrival.destination || arrival.stopHeadsign);
+    const destinationCandidates = [
+      terminal?.destination,
+      arrival.headsign,
+      arrival.destination,
+      arrival.stopHeadsign
+    ].map(normalizeText).filter(Boolean);
+    // Trip-specific terminal IDs cover scheduled and short-turn trips. Check
+    // every available name as well: a partial-course headsign can identify its
+    // actual short-turn terminal even when the static trip mapping names the
+    // full route's usual endpoint.
+    const destinationIsBoardStop = Boolean(
+      terminalStopId && stopAliases.has(terminalStopId)
+    ) || destinationCandidates.some(candidate =>
+      destinationMatchesBoardStop(candidate, '', stopAliases, stopNames)
+    );
+    const candidateDestination = destinationCandidates[0] || '';
+    const destination = destinationIsBoardStop ? '' : candidateDestination;
 
     const groupKey = `${routeId}|${destination}`;
     if (!groups.has(groupKey)) {
@@ -372,7 +433,6 @@ async function handler(req, res) {
       generated_at: refreshedAt,
       refreshed_at: refreshedAt,
       realtime_status: 'not_applicable',
-      realtime_message: 'Метролиниите се показват по официалното разписание; няма realtime данни.',
       provider: 'GT Sofia official GTFS timetable',
       realtime_only: false,
       routes
