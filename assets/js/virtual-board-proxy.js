@@ -97,54 +97,14 @@
     return original;
   }
 
-  function toUnixSeconds(value) {
-    if (value === null || value === undefined || value === '') return null;
-
-    const numeric = Number(value);
-    if (Number.isFinite(numeric)) {
-      if (numeric >= 1e12) return numeric / 1000;
-      if (numeric >= 1e9) return numeric;
-      return null;
-    }
-
-    const parsed = Date.parse(String(value));
-    return Number.isFinite(parsed) ? parsed / 1000 : null;
-  }
-
-  function normalizeProxyTime(time, loadedAt, route = null) {
+  function getMinutesUntilArrival(time) {
     if (time === null || time === undefined) return null;
 
     const source = typeof time === 'object' ? time : { t: time };
-    const explicitTimestamp = toUnixSeconds(
-      source.timestamp ?? source.actual_time ?? source.arrival_time
-    );
-    const minutes = source.t === null || source.t === undefined || source.t === ''
-      ? NaN
-      : Number(source.t);
-    const timestamp = explicitTimestamp !== null
-      ? explicitTimestamp
-      : (Number.isFinite(minutes) ? loadedAt + minutes * 60 : NaN);
+    if (source.t === null || source.t === undefined || source.t === '') return null;
 
-    if (!Number.isFinite(timestamp)) return null;
-
-    const hasRealtimeFlag = typeof source.realtime === 'boolean'
-      || typeof source.is_realtime === 'boolean'
-      || typeof route?.realtime === 'boolean'
-      || typeof route?.is_realtime === 'boolean';
-    const isRealtime = source.realtime === true
-      || source.is_realtime === true
-      || route?.realtime === true
-      || route?.is_realtime === true;
-    const scheduled = typeof source.scheduled === 'boolean'
-      ? source.scheduled
-      : (hasRealtimeFlag ? !isRealtime : true);
-
-    return {
-      ...source,
-      timestamp,
-      scheduled,
-      source: source.source || (isRealtime ? 'realtime' : 'proxy')
-    };
+    const minutes = Number(source.t);
+    return Number.isFinite(minutes) ? minutes : null;
   }
 
   function normalizeBoard(payload, options = {}) {
@@ -157,17 +117,25 @@
       ? options.resolveRouteMetadata
       : () => null;
 
+    // Keep every route and every arrival returned by the proxy. The proxy is
+    // the source of truth for arrival calculations; the browser only sorts
+    // the provided relative-minute values for presentation.
     const routes = (Array.isArray(source.routes) ? source.routes : [])
       .map((route, index) => {
-        const rawRoute = route && typeof route === 'object' ? route : {};
+        const rawRoute = route && typeof route === 'object'
+          ? route
+          : { value: route };
         const meta = resolveRouteMetadata(rawRoute) || {};
         const routeRef = normalizeText(rawRoute.route_ref || rawRoute.number || meta.number || '—');
         const times = (Array.isArray(rawRoute.times) ? rawRoute.times : [])
-          .map(time => normalizeProxyTime(time, loadedAt, rawRoute))
-          .filter(Boolean)
-          .sort((left, right) => left.timestamp - right.timestamp);
-
-        if (!times.length) return null;
+          .slice()
+          .sort((left, right) => {
+            const leftMinutes = getMinutesUntilArrival(left);
+            const rightMinutes = getMinutesUntilArrival(right);
+            if (leftMinutes === null) return rightMinutes === null ? 0 : 1;
+            if (rightMinutes === null) return -1;
+            return leftMinutes - rightMinutes;
+          });
 
         return {
           ...rawRoute,
@@ -190,19 +158,17 @@
               stopsByCode: options.stopsByCode
             }
           ),
+          // Preserve the proxy's original arrival objects, including `t`,
+          // `extras`, and any optional status fields.
           times
         };
-      })
-      .filter(Boolean);
+      });
 
     return {
       ...source,
       status: normalizeText(source.status) || (routes.length ? 'ok' : 'empty'),
       routes,
       loaded_at: loadedAt,
-      // The legacy proxy response used by the schedules project does not
-      // expose the private GTFS-RT trip identities from GTSofia's former API.
-      // Avoid presenting an arrival as LIVE unless the proxy explicitly says so.
       realtime_status: normalizeText(source.realtime_status)
         || (metro ? 'not_applicable' : 'available')
     };
@@ -213,7 +179,7 @@
     buildProxyUrl,
     isMetroStop,
     normalizeRouteType,
-    normalizeProxyTime,
+    getMinutesUntilArrival,
     normalizeBoard,
     resolveDestination
   });

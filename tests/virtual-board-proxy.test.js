@@ -55,6 +55,13 @@ const payload = {
       bg_color: 'EB2227',
       text_color: 'FFFFFF',
       times: [{ t: 4, realtime: true }]
+    },
+    {
+      cgm_id: 'T_EMPTY',
+      route_ref: '99',
+      type: 'bus',
+      destination: '0245',
+      times: []
     }
   ]
 };
@@ -77,17 +84,31 @@ const normalized = proxy.normalizeBoard(payload, {
 assert.equal(normalized.status, 'ok');
 assert.equal(normalized.loaded_at, loadedAt);
 assert.equal(normalized.realtime_status, 'available');
-assert.equal(normalized.routes.length, 2);
+assert.equal(normalized.routes.length, 3,
+  'every route returned by the proxy must be retained, even when it has no times');
 assert.equal(normalized.routes[0].destination, 'бул. Сливница');
-assert.equal(normalized.routes[0].times[0].timestamp, loadedAt + 3 * 60);
-assert.equal(normalized.routes[0].times[1].timestamp, loadedAt + 8 * 60);
-assert.equal(normalized.routes[0].times[0].scheduled, true,
-  'unclassified proxy times should not be presented as confirmed live predictions');
+assert.equal(normalized.routes[0].times[0].t, 3,
+  'proxy relative minutes must be kept as the source value');
+assert.equal(normalized.routes[0].times[1].t, 8,
+  'arrivals within a route stay sorted by the proxy relative-minute value');
+assert.deepEqual(normalized.routes[0].times[0].extras, ['1', '0', '1'],
+  'additional proxy arrival fields must be preserved');
+assert.equal('timestamp' in normalized.routes[0].times[0], false,
+  'the frontend must not synthesize timestamps from proxy minutes');
+assert.equal('scheduled' in normalized.routes[0].times[0], false,
+  'the frontend must not invent realtime/scheduled classifications');
 assert.equal(normalized.routes[0].meta.number, '1');
 assert.equal(normalized.routes[1].meta.type, 'metro');
 assert.equal(normalized.routes[1].meta.color, '#EB2227');
-assert.equal(normalized.routes[1].times[0].scheduled, false,
-  'an explicit realtime marker should be preserved');
+assert.equal(normalized.routes[1].times[0].realtime, true,
+  'an explicit realtime marker must be preserved');
+assert.deepEqual(normalized.routes[2].times, [],
+  'routes with empty times must not be removed');
+
+assert.equal(proxy.getMinutesUntilArrival({ t: '4' }), 4);
+assert.equal(proxy.getMinutesUntilArrival({ t: 2.5 }), 2.5,
+  'fractional proxy minutes must remain fractional instead of being rounded');
+assert.equal(proxy.getMinutesUntilArrival({ t: null }), null);
 
 const normalizedMetroDestination = proxy.normalizeBoard({
   status: 'ok',
@@ -113,7 +134,9 @@ const malformedTimes = proxy.normalizeBoard({
   stop: normalStop,
   nowSeconds: loadedAt
 });
-assert.equal(malformedTimes.routes.length, 0,
-  'routes without usable arrival times should be omitted');
+assert.equal(malformedTimes.routes.length, 1,
+  'routes with malformed arrivals must not be dropped');
+assert.equal(malformedTimes.routes[0].times.length, 2,
+  'malformed arrival objects must be preserved for transparent rendering/debugging');
 
 console.log('virtual-board-proxy: all tests passed');

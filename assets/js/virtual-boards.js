@@ -89,12 +89,19 @@
       .replaceAll("'", "&#039;");
   }
 
-  function getRouteFirstArrivalTimestamp(route) {
-    const timestamps = (Array.isArray(route?.times) ? route.times : [])
-      .filter(time => time?.timestamp !== null && time?.timestamp !== undefined && time?.timestamp !== '')
-      .map(time => Number(time.timestamp))
+  function getArrivalMinutes(time) {
+    if (time === null || time === undefined) return null;
+    const value = typeof time === "object" ? time.t : time;
+    if (value === null || value === undefined || value === "") return null;
+    const minutes = Number(value);
+    return Number.isFinite(minutes) ? minutes : null;
+  }
+
+  function getRouteFirstArrivalMinutes(route) {
+    const minutes = (Array.isArray(route?.times) ? route.times : [])
+      .map(getArrivalMinutes)
       .filter(Number.isFinite);
-    return timestamps.length ? Math.min(...timestamps) : Number.POSITIVE_INFINITY;
+    return minutes.length ? Math.min(...minutes) : Number.POSITIVE_INFINITY;
   }
 
   function sortBoardRoutesByNextArrival(routes) {
@@ -103,11 +110,17 @@
         ...route,
         times: (Array.isArray(route?.times) ? route.times : [])
           .slice()
-          .sort((left, right) => Number(left?.timestamp) - Number(right?.timestamp))
+          .sort((left, right) => {
+            const leftMinutes = getArrivalMinutes(left);
+            const rightMinutes = getArrivalMinutes(right);
+            if (leftMinutes === null) return rightMinutes === null ? 0 : 1;
+            if (rightMinutes === null) return -1;
+            return leftMinutes - rightMinutes;
+          })
       }))
       .sort((left, right) => {
-        const timeDifference = getRouteFirstArrivalTimestamp(left)
-          - getRouteFirstArrivalTimestamp(right);
+        const timeDifference = getRouteFirstArrivalMinutes(left)
+          - getRouteFirstArrivalMinutes(right);
         if (timeDifference) return timeDifference;
 
         const lineDifference = String(left?.route_ref || left?.meta?.number || '')
@@ -207,40 +220,31 @@
   }
 
   function formatArrivalCountdown(
-    timestamp,
-    nowSeconds = Date.now() / 1000
+    minutesUntilArrival
   ) {
-    const seconds = Number(timestamp);
+    const minutes = getArrivalMinutes(minutesUntilArrival);
+    if (minutes === null) return "";
 
-    if (!Number.isFinite(seconds)) return "";
+    // The proxy has already calculated the relative arrival time. Display it
+    // as supplied instead of deriving, rounding, or recalculating minutes.
+    const rawValue = typeof minutesUntilArrival === "object"
+      ? minutesUntilArrival.t
+      : minutesUntilArrival;
 
-    const remainingSeconds =
-      seconds - nowSeconds;
-
-    // Minutes are calculated once from the board's load timestamp. They stay
-    // fixed until the next automatic or manual board refresh.
-    // Arrival has reached the stop.
-    if (remainingSeconds <= 0) {
-      return "0 мин.";
-    }
-
-    // Display whole minutes only, rounded to the nearest minute from the exact
-    // remaining seconds (half a minute rounds up): 9:01 -> 9 мин., 9:30 ->
-    // 10 мин. A remaining time below 30 seconds rounds to 0 мин.
-    const minutes = Math.round(remainingSeconds / 60);
-
-    return `${minutes} мин.`;
+    return `${rawValue} мин.`;
   }
 
   function formatArrivalClock(
-    timestamp
+    minutesUntilArrival,
+    snapshotMilliseconds = Date.now()
   ) {
-    const seconds =
-      Number(timestamp);
+    const minutes = getArrivalMinutes(minutesUntilArrival);
+    if (minutes === null) return "—";
 
-    if (!Number.isFinite(seconds)) {
-      return "—";
-    }
+    // The relative `t` value is used only to render the expected clock time.
+    const arrivalDate = new Date(
+      snapshotMilliseconds + minutes * 60_000
+    );
 
     return new Intl.DateTimeFormat(
       "bg-BG",
@@ -250,38 +254,29 @@
         minute: "2-digit",
         hourCycle: "h23"
       }
-    ).format(
-      new Date(seconds * 1000)
-    );
+    ).format(arrivalDate);
   }
 
   function countdownHtml(
     arrival,
     showLive,
-    snapshotSeconds = Date.now() / 1000
+    snapshotMilliseconds = Date.now()
   ) {
-    const timestamp =
-      Number(arrival?.timestamp);
-
-    if (!Number.isFinite(timestamp)) {
-      return "";
+    const minutes = getArrivalMinutes(arrival);
+    if (minutes === null) {
+      return '<span class="vb-arrival-minutes">—</span>';
     }
 
-    const clock =
-      formatArrivalClock(
-        timestamp
-      );
+    const clock = formatArrivalClock(
+      arrival,
+      snapshotMilliseconds
+    );
 
-    const live =
-      showLive
-        ? '<span class="vb-arrival-live" aria-hidden="true"></span>'
-        : "";
+    const live = showLive
+      ? '<span class="vb-arrival-live" aria-hidden="true"></span>'
+      : "";
 
-    const countdown =
-      formatArrivalCountdown(
-        timestamp,
-        snapshotSeconds
-      );
+    const countdown = formatArrivalCountdown(arrival);
 
     return (
       `<div class="vb-arrival-main">`
@@ -615,7 +610,9 @@
 
     if (!list) return;
 
-    const snapshotSeconds = Number(data?.loaded_at) || Date.now() / 1000;
+    const snapshotMilliseconds = Number(data?.loaded_at)
+      ? Number(data.loaded_at) * 1000
+      : Date.now();
     renderBoardStatus(panel, data);
 
     if (
@@ -630,9 +627,7 @@
 
     // The proxy owns virtual-board data preparation. The browser resolves
     // local route/stop labels and renders the returned arrivals.
-    const rows = sortBoardRoutesByNextArrival(data.routes.filter(
-      route => Array.isArray(route?.times) && route.times.length > 0
-    ));
+    const rows = sortBoardRoutesByNextArrival(data.routes);
 
     if (!rows.length) {
       list.innerHTML =
@@ -663,14 +658,12 @@
               .map(
                 time => {
                   const tooltip =
-                    formatArrivalCountdown(
-                      time.timestamp,
-                      snapshotSeconds
-                    );
+                    formatArrivalCountdown(time);
 
                   const clock =
                     formatArrivalClock(
-                      time.timestamp
+                      time,
+                      snapshotMilliseconds
                     );
 
                   return (
@@ -702,8 +695,10 @@
               <div class="vb-time-block">
                 ${countdownHtml(
                   arrivals[0],
-                  !arrivals[0]?.scheduled,
-                  snapshotSeconds
+                  arrivals[0]?.realtime === true
+                    || arrivals[0]?.is_realtime === true
+                    || arrivals[0]?.scheduled === false,
+                  snapshotMilliseconds
                 )}
                 ${
                   arrivals.length > 1
@@ -1817,6 +1812,8 @@
   // Small test seam; production pages do not use this object.
   globalThis.__gtsofiaVirtualBoardTestInternals = {
     formatArrivalCountdown,
+    formatArrivalClock,
+    getArrivalMinutes,
     sortBoardRoutesByNextArrival,
     getBoardAutoRefreshDelay,
     recordBoardRefreshOutcome,
