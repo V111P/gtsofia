@@ -1,6 +1,17 @@
 """Schedule serialization grouped by route, direction and day type."""
 from .config import normalize, parse_time
 
+
+def format_gtfs_time(seconds):
+    """Format GTFS service seconds without losing precision after 24:00."""
+    if seconds is None:
+        return None
+    total = int(seconds)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    remaining_seconds = total % 60
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+
 def build_schedules(
     directions_result,
     logical_trips,
@@ -101,6 +112,12 @@ def build_schedules(
                         0
                     ]
 
+                    formatted_times = [format_gtfs_time(value) for value in values]
+                    arrival_values = item.get("arrival_times", [])
+                    formatted_arrival_times = [format_gtfs_time(value) for value in arrival_values]
+                    has_arrival = item.get("has_arrival", [])
+                    has_departure = item.get("has_departure", [])
+
                     schedule_row = {
 
                         "trip_id":
@@ -142,21 +159,9 @@ def build_schedules(
                             ],
 
                         "start_time":
-                            (
-                                f"{first // 60:02d}:"
-                                f"{first % 60:02d}:00"
-                            ),
+                            format_gtfs_time(first),
 
-                        "times":
-                            [
-                                (
-                                    f"{value // 60:02d}:"
-                                    f"{value % 60:02d}:00"
-                                )
-                                if value is not None
-                                else None
-                                for value in values
-                            ],
+                        "times": formatted_times,
 
                         "car":
                             item.get(
@@ -164,6 +169,16 @@ def build_schedules(
                                 ""
                             )
                     }
+
+                    # Keep event presence even when arrival and departure
+                    # timestamps are equal: GTFS-Realtime requires both events
+                    # when the static stop contains both.
+                    if formatted_arrival_times:
+                        schedule_row["arrival_times"] = formatted_arrival_times
+                    if has_arrival:
+                        schedule_row["has_arrival"] = [bool(value) for value in has_arrival]
+                    if has_departure:
+                        schedule_row["has_departure"] = [bool(value) for value in has_departure]
 
                     if "weekday" in trip_day_types:
                         weekday.append(dict(schedule_row))

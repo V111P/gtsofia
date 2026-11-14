@@ -39,7 +39,7 @@ function encodeStopTimeUpdate({ stopId = null, stopSequence = null, relationship
   if (stopId != null) fields.push(field(4, 2, text(stopId)));
   fields.push(field(5, 0, varint(relationship)));
 
-  if (timestamp != null || scheduledTime != null) {
+  if (timestamp != null || scheduledTime != null || delay != null) {
     const eventFields = [];
     if (delay != null) eventFields.push(field(1, 0, varint(delay)));
     if (timestamp != null) eventFields.push(field(2, 0, varint(timestamp)));
@@ -107,7 +107,7 @@ const normalFallbackCourse = staticAtStop0605.routes
   .filter(route => route.route_id === 'TB2')
   .flatMap(route => (route.times || [])
     .filter(time => time.scheduled)
-    .map(time => ({ ...route, ...time })))
+    .map(time => ({ ...route, ...time, original_trip_id: time.trip_id || route.original_trip_id })))
   .find(time => time.trip_id && time.trip_id !== deletedFallbackCourse.original_trip_id);
 assert.ok(normalFallbackCourse, 'GTFS must contain a second active TB2 course for the realtime ID-normalization test');
 
@@ -156,7 +156,7 @@ const noDataTrip = encodeTripUpdate({
 
 const normalTrip = encodeTripUpdate({
   trip: {
-    tripId: 'REALTIME-NORMAL',
+    tripId: normalFallbackCourse.original_trip_id,
     startTime: normalFallbackCourse.trip_start_time,
     routeId: 'TB2'
   },
@@ -164,7 +164,6 @@ const normalTrip = encodeTripUpdate({
     stopId: '0605',
     relationship: 0,
     timestamp: now + 60,
-    scheduledTime: now + 75,
     delay: -15,
     uncertainty: 30
   }]
@@ -178,7 +177,10 @@ const predepartureDelayTrip = encodeTripUpdate({
     routeId: 'TB7'
   },
   timestamp: now,
-  delay: 90
+  delay: 90,
+  // SCHEDULED TripUpdates must contain at least one StopTimeUpdate. This
+  // downstream update leaves TripUpdate.delay active at the earlier board stop.
+  stopUpdates: [{ stopSequence: 22, relationship: 0, delay: 0 }]
 });
 
 // An active TripUpdate descriptor identifies its exact scheduled course, but
@@ -274,20 +276,20 @@ const res = {
   assert.equal(Object.hasOwn(payload, 'skipped_trips'), false);
 
   const realtimeArrival = payload.routes.find(route =>
-    route.realtime_trip_id === 'REALTIME-NORMAL'
+    route.trip_id === normalFallbackCourse.original_trip_id
       && route.times?.some(time => Number(time.timestamp) === now + 60)
   );
   assert.ok(realtimeArrival, 'a stop-specific realtime prediction must be included in the final board response');
   assert.equal(realtimeArrival.realtime, true);
-  assert.notEqual(
+  assert.equal(
     realtimeArrival.trip_id,
-    'REALTIME-NORMAL',
-    'when exact route + start_time matching resolves a GTFS course, the board must expose its canonical GTFS Trip ID'
+    normalFallbackCourse.original_trip_id,
+    'a SCHEDULED TripUpdate must retain its exact canonical GTFS Trip ID'
   );
   assert.ok(
     realtimeArrival.times.some(time => time.trip_id === realtimeArrival.trip_id
-      && time.realtime_trip_id === 'REALTIME-NORMAL'),
-    'the arrival event must use the same canonical course identity as its route row while retaining the producer ID for diagnostics'
+      && !time.realtime_trip_id),
+    'the arrival event must use the exact canonical GTFS trip identity'
   );
   assert.ok(
     !payload.routes.flatMap(route => route.times || []).some(time => time.scheduled
@@ -297,9 +299,10 @@ const res = {
   assert.ok(realtimeArrival.meta, 'the API should return line display metadata');
   assert.ok(realtimeArrival.destination, 'the API should resolve a destination before returning the board');
   assert.ok(
-    realtimeArrival.times.some(time => time.delay === -15 && time.uncertainty === 30
-      && Number(time.scheduled_time) === now + 75),
-    'the protobuf decoder must preserve signed delay, scheduled time and uncertainty'
+    realtimeArrival.times.some(time => time.timestamp === now + 60
+      && time.uncertainty === 30
+      && Number.isFinite(time.delay)),
+    'the protobuf decoder must preserve absolute time and uncertainty, and the service must derive delay from the static GTFS event when time is authoritative'
   );
 
   const deletedFallbackTimes = payload.routes

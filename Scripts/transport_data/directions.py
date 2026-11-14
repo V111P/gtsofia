@@ -242,26 +242,19 @@ def build_reference_directions(
         )
 
         times = []
+        arrival_times = []
+        has_arrival = []
+        has_departure = []
 
         for stop_time in trip_stop_times:
+            arrival = parse_time(stop_time.get("arrival_time"))
+            departure = parse_time(stop_time.get("departure_time"))
+            preferred = departure if departure is not None else arrival
 
-            parsed = parse_time(
-                stop_time.get(
-                    "departure_time"
-                )
-                or stop_time.get(
-                    "arrival_time"
-                )
-            )
-
-            if parsed is None:
-                times.append(
-                    None
-                )
-            else:
-                times.append(
-                    parsed // 60
-                )
+            times.append(preferred)
+            arrival_times.append(arrival)
+            has_arrival.append(arrival is not None)
+            has_departure.append(departure is not None)
 
         logical_stop_times.append({
 
@@ -272,6 +265,16 @@ def build_reference_directions(
 
             "times":
                 times,
+
+            # Keep actual GTFS arrival times separately. The public timetable
+            # continues to use departure_time when available, but a realtime
+            # StopTimeEvent.time for an arrival must be compared with the
+            # corresponding static arrival_time, not with departure_time.
+            "arrival_times": arrival_times,
+            # Preserve event presence independently of event time equality.
+            # GTFS-Realtime requires both events when the static stop has both.
+            "has_arrival": has_arrival,
+            "has_departure": has_departure,
 
             # Preserve the GTFS stop_sequence alongside the padded timetable.
             # GTFS-Realtime StopTimeUpdate may identify a stop by sequence
@@ -534,6 +537,16 @@ def merge_partial_directions(
                         + [None]
                         * end_padding
                     )
+
+                    for field in ("arrival_times", "has_arrival", "has_departure"):
+                        if field not in item:
+                            continue
+                        padding_value = False if field.startswith("has_") else None
+                        item[field] = (
+                            [padding_value] * begin_padding
+                            + item[field]
+                            + [padding_value] * end_padding
+                        )
 
                 logical_trip[
                     "direction_code"

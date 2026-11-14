@@ -683,66 +683,41 @@ function stopIdsMatch(
   );
 }
 
-function eventTimestamp(
-  update
-) {
-  if (
-    Number.isFinite(
-      update?.arrival?.time
-    )
-  ) {
-    return update.arrival.time;
-  }
-
-  if (
-    Number.isFinite(
-      update?.departure?.time
-    )
-  ) {
-    return update.departure.time;
-  }
-
+function selectStopTimeEvent(update, preferDeparture = false) {
+  const arrival = update?.arrival || null;
+  const departure = update?.departure || null;
+  const hasTiming = event => event
+    && (Number.isFinite(event.time) || Number.isFinite(event.delay));
+  const preferred = preferDeparture ? departure : arrival;
+  const secondary = preferDeparture ? arrival : departure;
+  if (hasTiming(preferred)) return preferred;
+  if (hasTiming(secondary)) return secondary;
   return null;
+}
+
+function selectStopTimeEventType(update, preferDeparture = false) {
+  const event = selectStopTimeEvent(update, preferDeparture);
+  return event && update?.arrival === event ? 'arrival' : (event ? 'departure' : null);
+}
+
+function eventTimestamp(update) {
+  const event = selectStopTimeEvent(update);
+  return Number.isFinite(event?.time) ? event.time : null;
 }
 
 function eventDelay(update) {
-  if (
-    Number.isFinite(
-      update?.arrival?.delay
-    )
-  ) {
-    return update.arrival.delay;
-  }
-
-  if (
-    Number.isFinite(
-      update?.departure?.delay
-    )
-  ) {
-    return update.departure.delay;
-  }
-
-  return null;
+  const event = selectStopTimeEvent(update);
+  return Number.isFinite(event?.delay) ? event.delay : null;
 }
 
 function eventScheduledTime(update) {
-  if (Number.isSafeInteger(update?.arrival?.scheduledTime)) {
-    return update.arrival.scheduledTime;
-  }
-  if (Number.isSafeInteger(update?.departure?.scheduledTime)) {
-    return update.departure.scheduledTime;
-  }
-  return null;
+  const event = selectStopTimeEvent(update);
+  return Number.isSafeInteger(event?.scheduledTime) ? event.scheduledTime : null;
 }
 
 function eventUncertainty(update) {
-  if (Number.isSafeInteger(update?.arrival?.uncertainty)) {
-    return update.arrival.uncertainty;
-  }
-  if (Number.isSafeInteger(update?.departure?.uncertainty)) {
-    return update.departure.uncertainty;
-  }
-  return null;
+  const event = selectStopTimeEvent(update);
+  return Number.isSafeInteger(event?.uncertainty) ? event.uncertainty : null;
 }
 
 function getTripId(tripUpdate) {
@@ -860,9 +835,9 @@ function buildBoard(
     new Map();
 
   // Keep every current TripUpdate descriptor and its timing updates, even
-  // when it has no StopTimeUpdate for the selected stop. The service uses
-  // course-level realtime timing to suppress only that exact course's GTFS
-  // fallback; a bare descriptor without timing data does not suppress it.
+  // when it has no StopTimeUpdate for the selected stop. The service resolves
+  // the descriptor against the static trip and selected stop before deciding
+  // whether a realtime prediction replaces the GTFS fallback.
   const realtimeTrips = new Map();
 
   for (
@@ -909,11 +884,14 @@ function buildBoard(
     }
 
     if (
-      tripRelationship
-        === TRIP_RELATIONSHIP.CANCELED
-      || tripRelationship
-        === TRIP_RELATIONSHIP.DELETED
+      tripRelationship === TRIP_RELATIONSHIP.CANCELED
+      || tripRelationship === TRIP_RELATIONSHIP.DELETED
+      || tripRelationship === TRIP_RELATIONSHIP.DUPLICATED
     ) {
+      // DUPLICATED requires TripProperties (new trip ID, service date and
+      // start time) plus a shifted static schedule. Until that full mapping is
+      // available, do not mislabel it as the original scheduled trip. It does
+      // not cancel or replace the original GTFS trip.
       continue;
     }
 
@@ -948,22 +926,9 @@ function buildBoard(
           startTime,
           routeId,
           directionId,
-          stopUpdate.stopId
-            ? normalizeStopKey(
-                stopUpdate.stopId
-              )
-            : `seq:${
-                Number.isFinite(
-                  Number(
-                    stopUpdate.stopSequence
-                  )
-                )
-                  ? Number(
-                      stopUpdate
-                        .stopSequence
-                    )
-                  : ""
-              }`
+          Number.isSafeInteger(stopUpdate?.stopSequence)
+            ? `seq:${stopUpdate.stopSequence}`
+            : `stop:${String(stopUpdate?.stopId || '').trim()}`
         ].join("|");
 
         if (
@@ -1027,15 +992,19 @@ function buildBoard(
 
       let timestamp = eventTimestamp(stopUpdate);
       const delay = eventDelay(stopUpdate);
-      const scheduledTime = eventScheduledTime(stopUpdate);
+      const scheduledTime = [
+        TRIP_RELATIONSHIP.NEW,
+        TRIP_RELATIONSHIP.REPLACEMENT,
+        TRIP_RELATIONSHIP.DUPLICATED
+      ].includes(tripRelationship)
+        ? eventScheduledTime(stopUpdate)
+        : null;
+      const eventType = selectStopTimeEventType(stopUpdate);
 
-      // Some producers send scheduled_time + delay but omit absolute time.
-      // That pair is a usable prediction. scheduled_time by itself is only a
-      // timetable value, not evidence of realtime coverage at this stop.
-      if (timestamp === null && scheduledTime !== null && delay !== null) {
-        timestamp = scheduledTime + delay;
-      }
-
+      // For scheduled trips, StopTimeEvent.time is the absolute prediction;
+      // delay-only events are resolved against the matched static GTFS stop
+      // time by the virtual-board service. scheduled_time is only permitted
+      // for NEW, REPLACEMENT or DUPLICATED trips and is not itself a prediction.
       if (timestamp === null && delay === null) continue;
       if (timestamp !== null && timestamp < now - REALTIME_PAST_GRACE_SECONDS) continue;
       if (timestamp !== null && timestamp > now + LOOK_AHEAD_SECONDS) continue;
@@ -1112,6 +1081,9 @@ function buildBoard(
                 tripRelationship
               ]
                 || `UNKNOWN_${tripRelationship}`,
+            trip_update_timestamp: Number.isSafeInteger(tripUpdate.timestamp)
+              ? tripUpdate.timestamp
+              : null,
             destination_stop_id:
               terminalUpdate
                 ?.stopId
@@ -1119,6 +1091,13 @@ function buildBoard(
             times: []
           }
         );
+      }
+
+      const groupedTrip = grouped.get(key);
+      if (Number.isSafeInteger(tripUpdate.timestamp)
+        && (!Number.isSafeInteger(groupedTrip.trip_update_timestamp)
+          || tripUpdate.timestamp >= groupedTrip.trip_update_timestamp)) {
+        groupedTrip.trip_update_timestamp = tripUpdate.timestamp;
       }
 
       grouped
@@ -1134,6 +1113,9 @@ function buildBoard(
               stopRelationship
             ]
               || `UNKNOWN_${stopRelationship}`,
+          event_type: eventType,
+          stop_id: String(stopUpdate?.stopId || '').trim(),
+          stop_sequence: Number.isSafeInteger(stopUpdate?.stopSequence) ? stopUpdate.stopSequence : null,
           scheduled_time: scheduledTime,
           uncertainty: eventUncertainty(stopUpdate)
         });

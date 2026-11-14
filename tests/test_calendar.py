@@ -136,7 +136,10 @@ class CalendarTests(unittest.TestCase):
         logical_stop_times = [
             {
                 "trip": 1,
-                "times": [330],
+                "times": [330 * 60],
+                "arrival_times": [325 * 60],
+                "has_arrival": [True],
+                "has_departure": [True],
                 "car": "",
             }
         ]
@@ -149,6 +152,58 @@ class CalendarTests(unittest.TestCase):
 
         self.assertEqual(len(result["R1"]["D1"]["weekday"]), 1)
         self.assertEqual(len(result["R1"]["D1"]["weekend"]), 1)
+        self.assertEqual(result["R1"]["D1"]["weekday"][0]["times"], ["05:30:00"])
+        self.assertEqual(result["R1"]["D1"]["weekday"][0]["arrival_times"], ["05:25:00"])
+        self.assertEqual(result["R1"]["D1"]["weekday"][0]["has_arrival"], [True])
+        self.assertEqual(result["R1"]["D1"]["weekday"][0]["has_departure"], [True])
+
+    def test_schedule_times_preserve_seconds_and_extended_hours(self):
+        directions = {"R1": {"D1": {"code": "1"}}}
+        logical_trips = [{
+            "id": 1, "route_id": "R1", "direction_code": "1",
+            "day_types": ["weekday"], "is_deleted": False,
+        }]
+        logical_stop_times = [{
+            "trip": 1,
+            "times": [24 * 3600 + 30 * 60 + 17],
+            "arrival_times": [24 * 3600 + 30 * 60 + 12],
+            "has_arrival": [True],
+            "has_departure": [True],
+            "stop_sequences": [10],
+        }]
+
+        result = module.build_schedules(directions, logical_trips, logical_stop_times)
+        row = result["R1"]["D1"]["weekday"][0]
+        self.assertEqual(row["start_time"], "24:30:17")
+        self.assertEqual(row["times"], ["24:30:17"])
+        self.assertEqual(row["arrival_times"], ["24:30:12"])
+
+    def test_partial_direction_padding_keeps_event_metadata_aligned(self):
+        routes = [{"route_id": "R1"}]
+        directions = [
+            {"code": "PARENT", "stops": ["A", "B", "C", "D"], "is_deleted": False},
+            {"code": "CHILD", "stops": ["B", "C"], "is_deleted": False},
+        ]
+        logical_trips = [
+            {"id": 1, "route_id": "R1", "direction_code": "PARENT"},
+            {"id": 2, "route_id": "R1", "direction_code": "CHILD"},
+        ]
+        logical_stop_times = [{
+            "trip": 2,
+            "times": [36000, 36600],
+            "arrival_times": [35940, 36540],
+            "has_arrival": [True, True],
+            "has_departure": [True, True],
+            "stop_sequences": [20, 30],
+        }]
+
+        module.merge_partial_directions(routes, directions, logical_trips, logical_stop_times)
+        padded = logical_stop_times[0]
+        self.assertEqual(padded["times"], [None, 36000, 36600, None])
+        self.assertEqual(padded["arrival_times"], [None, 35940, 36540, None])
+        self.assertEqual(padded["has_arrival"], [False, True, True, False])
+        self.assertEqual(padded["has_departure"], [False, True, True, False])
+        self.assertEqual(padded["stop_sequences"], [None, 20, 30, None])
 
     def test_calendar_dates_only_feed_uses_explicit_service_dates(self):
         dates_only = [
