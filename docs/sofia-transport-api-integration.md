@@ -98,11 +98,23 @@ trips.
 
 The upstream API also does not return the GTFS-Realtime FeedHeader timestamp.
 GTSofia deliberately leaves `realtime_feed_timestamp` null instead of
-pretending that the time of the HTTP request is the feed timestamp. The
-existing browser-side history protection still prevents an already-predicted
-course from reappearing as a later static departure once its predicted arrival
-time has passed, but it cannot infer an upstream cancellation that was never
-returned by the API.
+pretending that the time of the HTTP request is the upstream feed timestamp.
+For browser-side course-history reconciliation only, GTSofia uses
+`refreshed_at` as the timestamp of its successful response snapshot when at
+least one arrival was mapped. If a previously observed realtime course is
+absent from that non-empty next snapshot, its later GTFS fallback is suppressed.
+An empty response or an unavailable API does not retire prior course history,
+so normal static fallback remains available in those cases. This snapshot time
+is not represented as a GTFS-Realtime FeedHeader timestamp.
+
+## Display horizon
+
+GTSofia keeps at most three upcoming times per route/destination row. Static
+and realtime arrivals are currently limited to the next 120 minutes (two
+hours). A row can therefore contain only two times when no third eligible
+arrival exists inside that horizon; this is intentional and does not imply a
+missing course. The lookahead can be extended separately if the product should
+show departures further into the future.
 
 These differences should be checked against real stop boards before removing
 any remaining compatibility logic or treating the integration as a complete

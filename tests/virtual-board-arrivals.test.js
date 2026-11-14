@@ -362,6 +362,108 @@ assert.equal(suppressPassedRealtimeFallbacks(disappearedCourseSnapshot, disappea
   .routes.flatMap(route => route.times).length, 0,
 'a completely disappeared realtime course must not be resurrected by its later timetable time');
 
+// Sofia Transport API does not expose FeedHeader.timestamp. A successful
+// non-empty API response snapshot still lets the browser retire a previously
+// observed course that has vanished from the next arrivals response before
+// the last predicted ETA. This prevents its later GTFS time from temporarily
+// reappearing while preserving static fallback on empty/unavailable responses.
+const sofiaSnapshotStopId = 'SOFIA-SNAPSHOT-EARLY-RUN-STOP';
+const sofiaSnapshotFirstPoll = 14 * 3600 + 38 * 60;
+const sofiaSnapshotCourse = {
+  route_id: 'TB42',
+  trip_id: 'GTFS-SOFIA-SNAPSHOT-42',
+  trip_start_date: '20261110',
+  trip_start_time: '14:00:00',
+  direction_id: 'D1',
+  terminal_stop_id: 'TERM-SOFIA'
+};
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    ...sofiaSnapshotCourse,
+    realtime: true,
+    times: [{
+      timestamp: sofiaSnapshotFirstPoll + 60,
+      scheduled_time: sofiaSnapshotFirstPoll + 240,
+      scheduled: false,
+      source: 'realtime',
+      ...sofiaSnapshotCourse
+    }]
+  }]
+}, sofiaSnapshotStopId, sofiaSnapshotFirstPoll);
+const sofiaSnapshotAfterDisappearance = {
+  realtime_status: 'available',
+  realtime_source: 'sofia-transport-api',
+  realtime_feed_timestamp: null,
+  realtime_matched_arrivals: 4,
+  realtime_courses: [],
+  refreshed_at: sofiaSnapshotFirstPoll + 30,
+  routes: [{
+    route_id: 'TB42',
+    terminal_stop_id: 'TERM-SOFIA',
+    times: [{
+      timestamp: sofiaSnapshotFirstPoll + 240,
+      scheduled: true,
+      source: 'static',
+      ...sofiaSnapshotCourse
+    }]
+  }]
+};
+assert.equal(
+  reconcileRealtimeCoursePresence(sofiaSnapshotAfterDisappearance, sofiaSnapshotStopId, sofiaSnapshotFirstPoll + 30),
+  true,
+  'a successful Sofia Transport API arrivals snapshot can retire a previously seen course even without a FeedHeader timestamp'
+);
+assert.equal(
+  suppressPassedRealtimeFallbacks(sofiaSnapshotAfterDisappearance, sofiaSnapshotStopId, sofiaSnapshotFirstPoll + 30)
+    .routes.flatMap(route => route.times).length,
+  0,
+  'a disappeared early-running Sofia API course must not return at its later GTFS time before the last ETA'
+);
+
+// An empty successful arrivals response does not prove that a previously
+// observed vehicle passed the stop; retain the timetable fallback in that case.
+const sofiaEmptySnapshotStopId = 'SOFIA-SNAPSHOT-EMPTY-STOP';
+rememberRealtimeArrivalPredictions({
+  routes: [{
+    ...sofiaSnapshotCourse,
+    realtime: true,
+    times: [{
+      timestamp: sofiaSnapshotFirstPoll + 60,
+      scheduled: false,
+      source: 'realtime',
+      ...sofiaSnapshotCourse
+    }]
+  }]
+}, sofiaEmptySnapshotStopId, sofiaSnapshotFirstPoll);
+const sofiaEmptySnapshot = {
+  realtime_status: 'available',
+  realtime_source: 'sofia-transport-api',
+  realtime_feed_timestamp: null,
+  realtime_matched_arrivals: 0,
+  realtime_courses: [],
+  refreshed_at: sofiaSnapshotFirstPoll + 30,
+  routes: [{
+    route_id: 'TB42',
+    times: [{
+      timestamp: sofiaSnapshotFirstPoll + 240,
+      scheduled: true,
+      source: 'static',
+      ...sofiaSnapshotCourse
+    }]
+  }]
+};
+assert.equal(
+  reconcileRealtimeCoursePresence(sofiaEmptySnapshot, sofiaEmptySnapshotStopId, sofiaSnapshotFirstPoll + 30),
+  false,
+  'an empty Sofia Transport API arrivals response must not retire previously observed realtime courses'
+);
+assert.equal(
+  suppressPassedRealtimeFallbacks(sofiaEmptySnapshot, sofiaEmptySnapshotStopId, sofiaSnapshotFirstPoll + 30)
+    .routes.flatMap(route => route.times).length,
+  1,
+  'an empty Sofia Transport API arrivals response must preserve the matching static fallback'
+);
+
 // Browser history must not infer passage or disappearance merely because a
 // descriptor has no prediction for this stop. Course-wide fallback suppression
 // is handled by the API; this only tests the client's history reconciliation.

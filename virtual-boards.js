@@ -367,8 +367,23 @@
     if (!Array.isArray(boardData?.realtime_courses)) return false;
 
     const feedTimestamp = Number(boardData?.realtime_feed_timestamp);
-    if (!Number.isFinite(feedTimestamp) || feedTimestamp <= 0) return false;
-    const feedAge = nowSeconds - feedTimestamp;
+    // Sofia Transport API exposes arrival snapshots, not the original
+    // GTFS-Realtime FeedHeader timestamp. For this provider only, use the
+    // timestamp at which GTSofia completed the successful API response as
+    // evidence that the current arrivals snapshot was fetched. This is NOT
+    // reported as the upstream feed timestamp; realtime_feed_timestamp stays
+    // null. Require at least one mapped realtime arrival so an empty response
+    // cannot retire previously observed courses and remove useful GTFS fallbacks.
+    const isSofiaTransportSnapshot = boardData?.realtime_source === 'sofia-transport-api'
+      && Number(boardData?.realtime_matched_arrivals) > 0;
+    const snapshotTimestamp = isSofiaTransportSnapshot
+      ? Number(boardData?.refreshed_at)
+      : NaN;
+    const evidenceTimestamp = Number.isFinite(feedTimestamp) && feedTimestamp > 0
+      ? feedTimestamp
+      : snapshotTimestamp;
+    if (!Number.isFinite(evidenceTimestamp) || evidenceTimestamp <= 0) return false;
+    const feedAge = nowSeconds - evidenceTimestamp;
     if (feedAge > REALTIME_FEED_MAX_AGE_SECONDS
       || feedAge < -REALTIME_FEED_MAX_FUTURE_SKEW_SECONDS) return false;
 
