@@ -1,6 +1,11 @@
 const { buildVirtualBoard } = require('./virtual-board-service');
 const tripsData = require('../data/trips.json');
 const stopsData = require('../data/stops.json');
+const { createTransitlandService } = require('./transitland-service');
+
+// The Transitland key is read only by this server-side function. The in-memory
+// cache coalesces/reuses stop queries within a warm Vercel function instance.
+const transitlandService = createTransitlandService();
 
 const FEED_URL = 'https://gtfs.sofiatraffic.bg/api/v1/trip-updates';
 const FEED_TIMEOUT_MS = 15000;
@@ -1324,6 +1329,27 @@ module.exports =
     }
 
     const now = new Date();
+    const configuredProvider = String(
+      process.env.VIRTUAL_BOARD_PROVIDER
+      || (process.env.TRANSITLAND_API_KEY ? 'transitland' : 'legacy')
+    ).trim().toLowerCase();
+
+    if (configuredProvider === 'transitland') {
+      try {
+        const board = await transitlandService.getBoard(stopCode, now);
+        setBoardResponseHeaders(res);
+        return res.status(200).json({
+          ...board,
+          refreshed_at: Math.floor(Date.now() / 1000)
+        });
+      } catch (error) {
+        // Keep the existing Sofia Traffic decoder as a safety net. This makes
+        // the rollout reversible and prevents a Transitland outage or missing
+        // key from taking virtual boards offline.
+        console.warn(`GTSofia Transitland fallback for stop ${stopCode}: ${error?.message || error}`);
+      }
+    }
+
     const metro = isMetroStop(stopCode);
     let realtimeBoard = {
       status: 'empty',
@@ -1364,6 +1390,7 @@ module.exports =
         realtime_status: realtimeStatus,
         realtime_message: realtimeMessage,
         realtime_feed_timestamp: realtimeFeedTimestamp,
+        provider: 'legacy',
         refreshed_at: Math.floor(Date.now() / 1000)
       });
     } catch (error) {
