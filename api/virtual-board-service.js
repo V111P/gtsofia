@@ -477,19 +477,34 @@ function createDataContext(data = {}) {
     );
   }
 
-  // SofiaTraffic's TripUpdates use the producer-specific surface-stop
-  // namespace `A<GTFS stop_id>` (for example, A1327) while the static GTFS
-  // bundled by this app uses `1327`. This is deliberately NOT a generic GTFS
-  // ID normalizer: exact IDs always win, and only the known producer prefix
-  // is adapted. Leading zeroes remain intact.
-  function realtimeStopIdMatchesStatic(staticStopId, realtimeStopId) {
+  // SofiaTraffic uses a distinct stop_id namespace per surface mode:
+  // A<code> for buses, TB<code> for trolleybuses and TM<code> for trams.
+  // This project's static-data generator deliberately stores the shared
+  // public stop code without that mode prefix (e.g. 0141). Adapt only the
+  // prefix that belongs to the already-matched static route. This is not a
+  // generic digit-extraction rule: exact IDs always win, route namespaces
+  // must agree, and leading zeroes remain intact.
+  function getSofiaRealtimeStopPrefix(staticInfo) {
+    const routeId = String(staticInfo?.routeId ?? '').trim().toUpperCase();
+    if (routeId.startsWith('TB')) return 'TB';
+    if (routeId.startsWith('TM')) return 'TM';
+    if (routeId.startsWith('A')) return 'A';
+    return '';
+  }
+
+  function realtimeStopIdMatchesStatic(staticStopId, realtimeStopId, staticInfo) {
     const staticId = String(staticStopId ?? '').trim();
     const realtimeId = String(realtimeStopId ?? '').trim();
     if (!staticId || !realtimeId) return false;
     if (staticId === realtimeId) return true;
 
-    const sofiaSurfaceMatch = realtimeId.match(/^A(\d+)$/);
-    return !!sofiaSurfaceMatch && staticId === sofiaSurfaceMatch[1];
+    const expectedPrefix = getSofiaRealtimeStopPrefix(staticInfo);
+    if (!expectedPrefix) return false;
+
+    const sofiaSurfaceMatch = realtimeId.match(/^(A|TB|TM)(\d+)$/);
+    return !!sofiaSurfaceMatch
+      && sofiaSurfaceMatch[1] === expectedPrefix
+      && staticId === sofiaSurfaceMatch[2];
   }
 
   function getRealtimeUpdateStopIndex(update, staticInfo) {
@@ -508,7 +523,7 @@ function createDataContext(data = {}) {
       const sequenceIndex = sequences.findIndex(value => Number(value) === sequence);
       if (sequenceIndex < 0 || sequenceIndex >= pattern.length) return -1;
       const stopId = String(update?.stop_id || '').trim();
-      if (stopId && !realtimeStopIdMatchesStatic(pattern[sequenceIndex], stopId)) return -1;
+      if (stopId && !realtimeStopIdMatchesStatic(pattern[sequenceIndex], stopId, staticInfo)) return -1;
       return sequenceIndex;
     }
 
@@ -516,7 +531,7 @@ function createDataContext(data = {}) {
     if (!stopId) return -1;
     const matches = [];
     for (let index = 0; index < pattern.length; index++) {
-      if (realtimeStopIdMatchesStatic(pattern[index], stopId)) matches.push(index);
+      if (realtimeStopIdMatchesStatic(pattern[index], stopId, staticInfo)) matches.push(index);
     }
     // stop_id alone is only safe when it identifies one occurrence. This is
     // important when a circular route visits the same physical stop twice.

@@ -282,6 +282,12 @@ const res = {
     'debug mode should report realtime arrivals in the final board response');
   assert.ok(Array.isArray(payload.realtime_diagnostics.trip_update_samples),
     'debug mode should include a small sample of decoded trip descriptors and stop updates');
+  assert.ok(payload.realtime_diagnostics.stop_time_updates_by_surface_namespace,
+    'debug mode should count bus, trolley, tram and metro stop-ID namespaces');
+  assert.ok(payload.realtime_diagnostics.trip_updates_by_route_namespace,
+    'debug mode should count route descriptors for bus, trolley and tram');
+  assert.ok(payload.realtime_diagnostics.trip_update_samples_by_surface_namespace,
+    'debug mode should include representative descriptors for each surface mode');
   assert.ok(payload.realtime_diagnostics.trip_updates_older_than_120_seconds > 0,
     'the fixture must include TripUpdates with older vehicle-measurement timestamps');
   assert.equal(Object.hasOwn(payload, 'active_trips'), false);

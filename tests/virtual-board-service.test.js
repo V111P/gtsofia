@@ -1352,6 +1352,40 @@ assert.ok(
   'the A-prefixed live stop ID A0141 must produce a realtime arrival for stop 0141'
 );
 
+// The static-data generator removes mode prefixes from surface stop IDs.
+// SofiaTraffic retains TB for trolleybuses, so the resolver must adapt TB0141
+// only when the already-matched static route is a trolley route.
+const actualTB2TripId = 'TB2-TB613-1-20-14357986210';
+const actualTB2Course = actualSchedules.TB2?.D2?.weekend?.find(row =>
+  row.original_trip_id === actualTB2TripId
+);
+assert.ok(actualTB2Course, 'the actual GTFS must contain the TB2 diagnostic trolley trip');
+const actualTB2RealtimeBoard = actual.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: actualTB2TripId,
+    route_id: 'TB2',
+    trip_start_date: '20261114',
+    trip_start_time: '18:09:00',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    trip_update_timestamp: Math.floor(actualSofiaNow.getTime() / 1000) - 1,
+    stop_time_updates: [{
+      stop_id: 'TB0141',
+      stop_sequence: 4,
+      schedule_relationship: 0,
+      arrival: { timestamp: actualA100RealtimeTimestamp - 180 }
+    }]
+  }]
+}, '0141', actualSofiaNow);
+assert.ok(
+  actualTB2RealtimeBoard.routes.some(route => route.route_id === 'TB2'
+    && route.times.some(time => time.source === 'realtime' && !time.scheduled
+      && Math.round(time.timestamp) === actualA100RealtimeTimestamp - 180)),
+  'the TB-prefixed live stop ID TB0141 must produce a realtime trolley arrival for stop 0141'
+);
+
 // Do not generalize the adapter into arbitrary digit extraction: unknown
 // prefixes remain unmapped and must leave the static GTFS fallback visible.
 const actualA100UnknownPrefixBoard = actual.buildBoard({
@@ -1376,6 +1410,29 @@ assert.ok(
     && route.times.some(time => time.scheduled === true
       && Math.round(time.timestamp) === actualA100RealtimeTimestamp)),
   'an unknown stop-ID prefix must not be accepted and the schedule fallback must remain'
+);
+
+const actualA100WrongModePrefixBoard = actual.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'A100-A674-2-18-12007370960',
+    route_id: 'A100',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    trip_update_timestamp: Math.floor(actualSofiaNow.getTime() / 1000) - 1,
+    stop_time_updates: [{
+      stop_id: 'TB0141',
+      stop_sequence: null,
+      schedule_relationship: 0,
+      arrival: { timestamp: actualA100RealtimeTimestamp }
+    }]
+  }]
+}, '0141', actualSofiaNow);
+assert.ok(
+  !actualA100WrongModePrefixBoard.routes.some(route => route.route_id === 'A100'
+    && route.times.some(time => time.source === 'realtime' || time.scheduled === false)),
+  'a trolleybus stop namespace must not be accepted for a bus route'
 );
 const actualRoute = actualRoutes.find(route => route.route_id === 'TB7');
 assert.ok(actualRoute, 'the actual data must contain trolleybus 7');
@@ -1451,6 +1508,7 @@ const tm22RealtimeTrip = {
   schedule_relationship_name: 'SCHEDULED',
   stop_time_updates: [
     {
+      stop_id: 'TM0470',
       stop_sequence: tm22Course.stop_sequences[tm22Indexes[2]],
       arrival: { timestamp: tm22UpdateAt0470 }
     },

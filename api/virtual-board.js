@@ -1299,6 +1299,33 @@ function summarizeRealtimeDiagnostics(feed, board, nowSeconds) {
       + (update.stopTimeUpdates || []).filter(item => Number.isSafeInteger(item?.stopSequence)).length, 0),
     stop_time_updates_with_sofia_a_prefix: updates.reduce((sum, update) => sum
       + (update.stopTimeUpdates || []).filter(item => /^A\d+$/.test(String(item?.stopId || '').trim())).length, 0),
+    stop_time_updates_by_surface_namespace: {
+      bus_A: updates.reduce((sum, update) => sum
+        + (update.stopTimeUpdates || []).filter(item => /^A\d+$/.test(String(item?.stopId || '').trim())).length, 0),
+      trolley_TB: updates.reduce((sum, update) => sum
+        + (update.stopTimeUpdates || []).filter(item => /^TB\d+$/.test(String(item?.stopId || '').trim())).length, 0),
+      tram_TM: updates.reduce((sum, update) => sum
+        + (update.stopTimeUpdates || []).filter(item => /^TM\d+$/.test(String(item?.stopId || '').trim())).length, 0),
+      metro_M: updates.reduce((sum, update) => sum
+        + (update.stopTimeUpdates || []).filter(item => /^M\d+$/.test(String(item?.stopId || '').trim())).length, 0)
+    },
+    trip_updates_by_route_namespace: {
+      bus_A: updates.filter(update => /^A/.test(getTripRouteId(update))).length,
+      trolley_TB: updates.filter(update => /^TB/.test(getTripRouteId(update))).length,
+      tram_TM: updates.filter(update => /^TM/.test(getTripRouteId(update))).length
+    },
+    trip_update_samples_by_surface_namespace: Object.fromEntries(
+      [['bus_A', /^A/], ['trolley_TB', /^TB/], ['tram_TM', /^TM/]].map(([mode, pattern]) => [
+        mode,
+        updates.filter(update => pattern.test(getTripRouteId(update))).slice(0, 2).map(update => ({
+          trip_id: getTripId(update),
+          route_id: getTripRouteId(update),
+          stop_updates: (Array.isArray(update?.stopTimeUpdates) ? update.stopTimeUpdates : [])
+            .slice(0, 3)
+            .map(item => ({ stop_id: String(item?.stopId || ''), stop_sequence: Number.isSafeInteger(item?.stopSequence) ? item.stopSequence : null }))
+        }))
+      ])
+    ),
     trip_update_samples: updates.slice(0, 5).map(update => ({
       trip_id: getTripId(update),
       route_id: getTripRouteId(update),
