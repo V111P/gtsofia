@@ -1,11 +1,7 @@
 const { buildVirtualBoard } = require('./virtual-board-service');
+const { fetchProxyTripUpdates } = require('../services/sofia-transport-client');
 const tripsData = require('../data/trips.json');
 const stopsData = require('../data/stops.json');
-const { createTransitlandService } = require('./transitland-service');
-
-// The Transitland key is read only by this server-side function. The in-memory
-// cache coalesces/reuses stop queries within a warm Vercel function instance.
-const transitlandService = createTransitlandService();
 
 const FEED_URL = 'https://gtfs.sofiatraffic.bg/api/v1/trip-updates';
 const FEED_TIMEOUT_MS = 15000;
@@ -1264,12 +1260,43 @@ async function fetchRealtimeFeed() {
 }
 
 async function getRealtimeFeed() {
-  // Do not retain a feed snapshot between refreshes. Coalesce only requests
-  // that are genuinely concurrent, then discard the Promise so the next
-  // scheduled or manual refresh fetches a fresh upstream snapshot.
+  // The separately hosted Sofia Transport API is the preferred JSON proxy.
+  // Its long-lived process caches the decoded GTFS-RT snapshot for ~60s, so
+  // multiple GTSofia serverless instances do not all decode the same feed.
+  // Keep the original direct decoder as a safe fallback until the proxy is
+  // unavailable or not configured.
   if (feedFetchPromise) return feedFetchPromise;
 
-  feedFetchPromise = fetchRealtimeFeed().finally(() => {
+  feedFetchPromise = (async () => {
+    const proxyConfigured = Boolean(String(process.env.SOFIA_TRANSPORT_API_URL || '').trim());
+    if (proxyConfigured) {
+      try {
+        return await fetchProxyTripUpdates();
+      } catch (proxyError) {
+        const detail = proxyError?.message || 'Unknown proxy error';
+        console.warn(`GTSofia Sofia Transport API fallback: ${detail}`);
+        try {
+          const legacyFeed = await fetchRealtimeFeed();
+          return {
+            ...legacyFeed,
+            provider: 'legacy',
+            proxyError: detail
+          };
+        } catch (legacyError) {
+          const combined = new Error(
+            `Sofia Transport API failed (${detail}); direct GTFS-RT fallback failed (${legacyError?.message || 'unknown error'}).`
+          );
+          combined.cause = legacyError;
+          throw combined;
+        }
+      }
+    }
+
+    return {
+      ...(await fetchRealtimeFeed()),
+      provider: 'legacy'
+    };
+  })().finally(() => {
     feedFetchPromise = null;
   });
 
@@ -1329,27 +1356,6 @@ module.exports =
     }
 
     const now = new Date();
-    const configuredProvider = String(
-      process.env.VIRTUAL_BOARD_PROVIDER
-      || (process.env.TRANSITLAND_API_KEY ? 'transitland' : 'legacy')
-    ).trim().toLowerCase();
-
-    if (configuredProvider === 'transitland') {
-      try {
-        const board = await transitlandService.getBoard(stopCode, now);
-        setBoardResponseHeaders(res);
-        return res.status(200).json({
-          ...board,
-          refreshed_at: Math.floor(Date.now() / 1000)
-        });
-      } catch (error) {
-        // Keep the existing Sofia Traffic decoder as a safety net. This makes
-        // the rollout reversible and prevents a Transitland outage or missing
-        // key from taking virtual boards offline.
-        console.warn(`GTSofia Transitland fallback for stop ${stopCode}: ${error?.message || error}`);
-      }
-    }
-
     const metro = isMetroStop(stopCode);
     let realtimeBoard = {
       status: 'empty',
@@ -1362,11 +1368,16 @@ module.exports =
     let realtimeStatus = metro ? 'not_applicable' : 'available';
     let realtimeMessage = '';
     let realtimeFeedTimestamp = null;
+    let provider = metro ? 'schedule' : 'legacy';
 
     if (!metro) {
       try {
         const feed = await getRealtimeFeed();
         realtimeFeedTimestamp = feed.feedTimestamp;
+        provider = feed.provider || 'legacy';
+        if (feed.proxyError) {
+          realtimeMessage = 'Външният JSON proxy е временно недостъпен — използваме резервния източник.';
+        }
         realtimeBoard = buildBoard(
           feed.updates,
           stopCode,
@@ -1374,6 +1385,7 @@ module.exports =
         );
       } catch (error) {
         realtimeStatus = 'unavailable';
+        provider = 'schedule';
         realtimeMessage = 'Realtime информацията временно не е налична — показваме разписанието.';
         const detail = error?.name === 'AbortError'
           ? 'Sofia Traffic GTFS-RT request timed out.'
@@ -1390,7 +1402,7 @@ module.exports =
         realtime_status: realtimeStatus,
         realtime_message: realtimeMessage,
         realtime_feed_timestamp: realtimeFeedTimestamp,
-        provider: 'legacy',
+        provider,
         refreshed_at: Math.floor(Date.now() / 1000)
       });
     } catch (error) {

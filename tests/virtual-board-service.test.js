@@ -1022,7 +1022,7 @@ assert.equal(actualTrolley.terminal_stop_id, actualTerminalId, 'the API must rep
 // stop time is 0803 (ж.к. Банишора), before the full D1 terminal 0610. Those
 // trips must not be displayed on a board at 0803, while full trips continuing
 // to 0610 must remain visible there.
-// Use a weekday inside the current checked-in calendar coverage so this test
+// Use the current checked-in calendar's first covered date so this test
 // checks terminal handling rather than an intentionally inactive day.
 const actualShortTurnBoard = actual.buildBoard({ routes: [], skipped_trips: [] }, '0803', new Date('2026-11-16T20:00:00+02:00'));
 const actualShortTurnRows = actualShortTurnBoard.routes.filter(route => route.route_id === 'TB7');

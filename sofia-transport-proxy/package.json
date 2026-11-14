@@ -1,0 +1,20 @@
+{
+  "name": "gtsofia-sofia-transport-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted JSON proxy for Sofia GTFS and GTFS-Realtime, adapted for GTSofia.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "csv-parse": "^5.5.6",
+    "express": "^4.21.1",
+    "gtfs-realtime-bindings": "^1.1.1"
+  }
+}

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: gtsofia-sofia-transport-proxy
+    runtime: node
+    plan: free
+    region: frankfurt
+    rootDir: sofia-transport-proxy
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SOFIA_TRANSPORT_PROXY_API_KEY
+        generateValue: true
