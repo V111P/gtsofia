@@ -273,15 +273,55 @@ function makeCourseKey(routeId, tripId, serviceDate, startTime, directionId) {
   return [routeId, tripId, serviceDate, startTime, directionId].map(value => String(value || '').trim()).join('|');
 }
 
+function resolveTransitlandStop(response, requestedStop) {
+  const returnedStops = Array.isArray(response?.stops) ? response.stops : [];
+  const requestedStopId = String(requestedStop?.stop_id || '').trim();
+  const requestedStopCode = String(requestedStop?.stop_code || '').trim();
+
+  if (!returnedStops.length) {
+    throw new Error(`Transitland returned no stop records for GTFS stop_id ${requestedStopId || '(missing)'}.`);
+  }
+
+  const exactStopId = returnedStops.find(item =>
+    String(item?.stop_id || '').trim() === requestedStopId
+  );
+  if (exactStopId) return exactStopId;
+
+  // Some imported feed versions expose the rider-facing stop_code differently
+  // from the source stop_id. The departures endpoint is already scoped to the
+  // feed-specific stop key, so an exact stop_code match is a safe fallback.
+  if (requestedStopCode) {
+    const exactStopCode = returnedStops.find(item =>
+      String(item?.stop_code || '').trim() === requestedStopCode
+    );
+    if (exactStopCode) return exactStopCode;
+  }
+
+  // A feed-scoped stop_key should resolve to one stop. Trust a single returned
+  // record even if Transitland's imported stop_id is normalized differently.
+  if (returnedStops.length === 1) return returnedStops[0];
+
+  const expectedFeedStops = returnedStops.filter(item =>
+    String(item?.feed_version?.feed?.onestop_id || '').trim() === FEED_ONESTOP_ID
+  );
+  if (expectedFeedStops.length === 1) return expectedFeedStops[0];
+
+  const describe = item => [
+    `stop_id=${String(item?.stop_id || '')}`,
+    `stop_code=${String(item?.stop_code || '')}`,
+    `name=${String(item?.stop_name || '').slice(0, 80)}`
+  ].join(', ');
+  const returnedSummary = returnedStops.slice(0, 5).map(describe).join('; ');
+  throw new Error(
+    `Transitland could not uniquely match Sofia stop_id ${requestedStopId || '(missing)'} `
+    + `(${returnedStops.length} stop records returned: ${returnedSummary || 'no identifiers'}).`
+  );
+}
+
 function buildTransitlandBoard(response, stop, now = new Date(), options = {}) {
   const nowSeconds = Math.floor(now.getTime() / 1000);
   const isMetro = /^M/i.test(String(stop?.stop_id || '')) || /^M/i.test(String(stop?.stop_code || ''));
-  const matchingStop = (Array.isArray(response?.stops) ? response.stops : [])
-    .find(item => String(item?.stop_id || '').trim() === String(stop.stop_id || '').trim())
-    || response?.stops?.[0]
-    || null;
-
-  if (!matchingStop) throw new Error('Transitland did not return the requested Sofia stop.');
+  const matchingStop = resolveTransitlandStop(response, stop);
 
   const departures = Array.isArray(matchingStop.departures) ? matchingStop.departures : [];
   const grouped = new Map();
@@ -440,12 +480,15 @@ function createTransitlandService(options = {}) {
   const cache = options.cache || new Map();
   const inFlight = options.inFlight || new Map();
 
-  async function fetchStopDepartures(stopId, date, lookaheadSeconds) {
+  async function fetchStopDepartures(stopId, date, lookaheadSeconds, requestedStop) {
     if (!apiKey) throw new Error('TRANSITLAND_API_KEY is not configured.');
     if (typeof fetchImpl !== 'function') throw new Error('This Node.js runtime does not provide fetch().');
 
-    const stopKey = `${FEED_ONESTOP_ID}:${stopId}`;
-    const url = new URL(`${TRANSITLAND_BASE_URL}/stops/${encodeURIComponent(stopKey)}/departures`);
+    // Transitland documents this path key as <feed_onestop_id>:<gtfs_stop_id>.
+    // Keep the separator colon literal in the path (rather than percent-encoding
+    // the entire compound key) and encode only the individual ID components.
+    const stopKeyPath = `${encodeURIComponent(FEED_ONESTOP_ID)}:${encodeURIComponent(stopId)}`;
+    const url = new URL(`${TRANSITLAND_BASE_URL}/stops/${stopKeyPath}/departures`);
     url.searchParams.set('date', date);
     url.searchParams.set('next', String(lookaheadSeconds));
     url.searchParams.set('limit', '200');
@@ -472,10 +515,10 @@ function createTransitlandService(options = {}) {
       if (!data || !Array.isArray(data.stops)) {
         throw new Error('Transitland returned an unexpected departures response.');
       }
-      const matchingStop = data.stops.find(item => String(item?.stop_id || '').trim() === stopId);
-      if (!matchingStop) {
-        throw new Error(`Transitland did not resolve GTFS stop_id ${stopId} in Sofia feed.`);
-      }
+      // Validate the record using the source stop_id, rider-facing stop_code,
+      // or the single record returned by the feed-scoped stop lookup. Include
+      // safe stop metadata in errors so future mismatches are diagnosable.
+      resolveTransitlandStop(data, requestedStop);
       return data;
     } catch (error) {
       if (error?.name === 'AbortError') throw new Error('Transitland request timed out.');
@@ -507,7 +550,7 @@ function createTransitlandService(options = {}) {
       return buildTransitlandBoard(shared.data, stop, now, { cacheStatus: 'coalesced' });
     }
 
-    const pending = fetchStopDepartures(stopId, date, requestLookahead)
+    const pending = fetchStopDepartures(stopId, date, requestLookahead, stop)
       .then(data => {
         cache.set(cacheKey, { data, fetchedAt: Date.now() });
         return { data, fetchedAt: Date.now() };
@@ -535,6 +578,7 @@ function createTransitlandService(options = {}) {
 module.exports = {
   createTransitlandService,
   buildTransitlandBoard,
+  resolveTransitlandStop,
   getSofiaDateKey,
   getSofiaTimeString,
   parseLocalDateTimeToEpochSeconds,
