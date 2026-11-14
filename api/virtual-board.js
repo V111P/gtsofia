@@ -1295,6 +1295,10 @@ function summarizeRealtimeDiagnostics(feed, board, nowSeconds) {
     trip_updates_older_than_120_seconds: ages.filter(age => age > 120).length,
     oldest_trip_update_age_seconds: ages.length ? Math.max(...ages) : null,
     stop_time_updates: updates.reduce((sum, update) => sum + (update.stopTimeUpdates?.length || 0), 0),
+    stop_time_updates_with_sequence: updates.reduce((sum, update) => sum
+      + (update.stopTimeUpdates || []).filter(item => Number.isSafeInteger(item?.stopSequence)).length, 0),
+    stop_time_updates_with_sofia_a_prefix: updates.reduce((sum, update) => sum
+      + (update.stopTimeUpdates || []).filter(item => /^A\d+$/.test(String(item?.stopId || '').trim())).length, 0),
     trip_update_samples: updates.slice(0, 5).map(update => ({
       trip_id: getTripId(update),
       route_id: getTripRouteId(update),

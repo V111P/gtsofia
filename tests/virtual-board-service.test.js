@@ -1317,6 +1317,66 @@ const actual = createDataContext();
 const actualRoutes = require('../data/routes.json');
 const actualDirections = require('../data/directions.json');
 const actualSchedules = require('../data/schedules.json');
+
+// Regression for the live SofiaTraffic feed: its stop IDs are A-prefixed,
+// while this project's static GTFS stop IDs are unprefixed. The exact A100
+// course shown by the user's board at stop 0141 must therefore render realtime.
+const actualA100Course = actualSchedules.A100?.D2?.weekend?.find(row =>
+  row.original_trip_id === 'A100-A674-2-18-12007370960'
+);
+assert.ok(actualA100Course, 'the actual GTFS must contain the A100 diagnostic trip');
+const actualSofiaNow = new Date('2026-11-14T18:11:35+02:00');
+const actualA100RealtimeTimestamp = Date.parse('2026-11-14T18:16:00+02:00') / 1000;
+const actualA100RealtimeBoard = actual.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'A100-A674-2-18-12007370960',
+    route_id: 'A100',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    trip_update_timestamp: Math.floor(actualSofiaNow.getTime() / 1000) - 1,
+    stop_time_updates: [{
+      stop_id: 'A0141',
+      stop_sequence: null,
+      schedule_relationship: 0,
+      arrival: { timestamp: actualA100RealtimeTimestamp }
+    }]
+  }]
+}, '0141', actualSofiaNow);
+assert.ok(
+  actualA100RealtimeBoard.routes.some(route => route.route_id === 'A100'
+    && route.times.some(time => time.source === 'realtime'
+      && time.scheduled === false
+      && Math.round(time.timestamp) === actualA100RealtimeTimestamp)),
+  'the A-prefixed live stop ID A0141 must produce a realtime arrival for stop 0141'
+);
+
+// Do not generalize the adapter into arbitrary digit extraction: unknown
+// prefixes remain unmapped and must leave the static GTFS fallback visible.
+const actualA100UnknownPrefixBoard = actual.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'A100-A674-2-18-12007370960',
+    route_id: 'A100',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    trip_update_timestamp: Math.floor(actualSofiaNow.getTime() / 1000) - 1,
+    stop_time_updates: [{
+      stop_id: 'B0141',
+      stop_sequence: null,
+      schedule_relationship: 0,
+      arrival: { timestamp: actualA100RealtimeTimestamp }
+    }]
+  }]
+}, '0141', actualSofiaNow);
+assert.ok(
+  actualA100UnknownPrefixBoard.routes.some(route => route.route_id === 'A100'
+    && route.times.some(time => time.scheduled === true
+      && Math.round(time.timestamp) === actualA100RealtimeTimestamp)),
+  'an unknown stop-ID prefix must not be accepted and the schedule fallback must remain'
+);
 const actualRoute = actualRoutes.find(route => route.route_id === 'TB7');
 assert.ok(actualRoute, 'the actual data must contain trolleybus 7');
 const actualDirection = Object.entries(actualDirections.TB7 || {}).find(([, direction]) =>

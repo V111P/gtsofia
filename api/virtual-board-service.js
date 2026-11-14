@@ -477,6 +477,21 @@ function createDataContext(data = {}) {
     );
   }
 
+  // SofiaTraffic's TripUpdates use the producer-specific surface-stop
+  // namespace `A<GTFS stop_id>` (for example, A1327) while the static GTFS
+  // bundled by this app uses `1327`. This is deliberately NOT a generic GTFS
+  // ID normalizer: exact IDs always win, and only the known producer prefix
+  // is adapted. Leading zeroes remain intact.
+  function realtimeStopIdMatchesStatic(staticStopId, realtimeStopId) {
+    const staticId = String(staticStopId ?? '').trim();
+    const realtimeId = String(realtimeStopId ?? '').trim();
+    if (!staticId || !realtimeId) return false;
+    if (staticId === realtimeId) return true;
+
+    const sofiaSurfaceMatch = realtimeId.match(/^A(\d+)$/);
+    return !!sofiaSurfaceMatch && staticId === sofiaSurfaceMatch[1];
+  }
+
   function getRealtimeUpdateStopIndex(update, staticInfo) {
     const pattern = Array.isArray(staticInfo?.direction?.pattern)
       ? staticInfo.direction.pattern.map(String)
@@ -493,9 +508,7 @@ function createDataContext(data = {}) {
       const sequenceIndex = sequences.findIndex(value => Number(value) === sequence);
       if (sequenceIndex < 0 || sequenceIndex >= pattern.length) return -1;
       const stopId = String(update?.stop_id || '').trim();
-      // GTFS IDs are opaque, case-sensitive strings. Do not normalize
-      // leading zeroes or aliases when validating a realtime stop reference.
-      if (stopId && String(pattern[sequenceIndex]).trim() !== stopId) return -1;
+      if (stopId && !realtimeStopIdMatchesStatic(pattern[sequenceIndex], stopId)) return -1;
       return sequenceIndex;
     }
 
@@ -503,9 +516,10 @@ function createDataContext(data = {}) {
     if (!stopId) return -1;
     const matches = [];
     for (let index = 0; index < pattern.length; index++) {
-      if (String(pattern[index]).trim() === stopId) matches.push(index);
+      if (realtimeStopIdMatchesStatic(pattern[index], stopId)) matches.push(index);
     }
-    // stop_id alone is only safe when it identifies one occurrence.
+    // stop_id alone is only safe when it identifies one occurrence. This is
+    // important when a circular route visits the same physical stop twice.
     return matches.length === 1 ? matches[0] : -1;
   }
 
