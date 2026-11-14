@@ -1269,6 +1269,60 @@ function setBoardResponseHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
 }
 
+function summarizeRealtimeDiagnostics(feed, board, nowSeconds) {
+  const updates = Array.isArray(feed?.updates) ? feed.updates : [];
+  const ages = updates
+    .map(update => Number.isSafeInteger(update?.timestamp)
+      ? nowSeconds - update.timestamp
+      : null)
+    .filter(age => age !== null);
+  const finalArrivals = (Array.isArray(board?.routes) ? board.routes : [])
+    .flatMap(route => Array.isArray(route?.times) ? route.times : []);
+
+  return {
+    feed_timestamp: Number.isFinite(feed?.feedTimestamp) ? feed.feedTimestamp : null,
+    feed_timestamp_age_seconds: Number.isFinite(feed?.feedTimestamp)
+      ? nowSeconds - feed.feedTimestamp
+      : null,
+    feed_max_age_seconds: MAX_FEED_AGE_SECONDS,
+    decoded_trip_updates: updates.length,
+    trip_updates_with_trip_id: updates.filter(update => Boolean(getTripId(update))).length,
+    trip_updates_with_route_id: updates.filter(update => Boolean(getTripRouteId(update))).length,
+    trip_updates_with_start_date: updates.filter(update => Boolean(getTripStartDate(update))).length,
+    trip_updates_with_start_time: updates.filter(update => Boolean(getTripStartTime(update))).length,
+    trip_updates_with_direction_id: updates.filter(update => Boolean(getTripDirectionId(update))).length,
+    trip_updates_with_timestamp: ages.length,
+    trip_updates_older_than_120_seconds: ages.filter(age => age > 120).length,
+    oldest_trip_update_age_seconds: ages.length ? Math.max(...ages) : null,
+    stop_time_updates: updates.reduce((sum, update) => sum + (update.stopTimeUpdates?.length || 0), 0),
+    trip_update_samples: updates.slice(0, 5).map(update => ({
+      trip_id: getTripId(update),
+      route_id: getTripRouteId(update),
+      direction_id: getTripDirectionId(update),
+      start_date: getTripStartDate(update),
+      start_time: getTripStartTime(update),
+      timestamp: Number.isSafeInteger(update?.timestamp) ? update.timestamp : null,
+      stop_updates: (Array.isArray(update?.stopTimeUpdates) ? update.stopTimeUpdates : [])
+        .slice(0, 4)
+        .map(stopUpdate => ({
+          stop_id: String(stopUpdate?.stopId || ''),
+          stop_sequence: Number.isSafeInteger(stopUpdate?.stopSequence) ? stopUpdate.stopSequence : null,
+          schedule_relationship: getStopRelationship(stopUpdate),
+          arrival_time: Number.isSafeInteger(stopUpdate?.arrival?.time) ? stopUpdate.arrival.time : null,
+          arrival_delay: Number.isSafeInteger(stopUpdate?.arrival?.delay) ? stopUpdate.arrival.delay : null,
+          departure_time: Number.isSafeInteger(stopUpdate?.departure?.time) ? stopUpdate.departure.time : null,
+          departure_delay: Number.isSafeInteger(stopUpdate?.departure?.delay) ? stopUpdate.departure.delay : null
+        }))
+    })),
+    output_realtime_arrivals: finalArrivals.filter(time => time?.source === 'realtime' || time?.scheduled === false).length,
+    output_static_arrivals: finalArrivals.filter(time => time?.source === 'static' || time?.scheduled === true).length,
+    output_realtime_routes: (Array.isArray(board?.routes) ? board.routes : [])
+      .filter(route => route?.source === 'realtime' || route?.realtime === true)
+      .slice(0, 5)
+      .map(route => ({ route_id: route.route_id, trip_id: route.trip_id, direction_id: route.direction_id }))
+  };
+}
+
 module.exports =
   async function handler(
     req,
@@ -1295,6 +1349,7 @@ module.exports =
         req.query?.stop_code
         || ""
       ).trim();
+    const debugEnabled = String(req.query?.debug || '') === '1';
 
     if (!stopCode) {
       return res
@@ -1318,10 +1373,14 @@ module.exports =
     let realtimeStatus = metro ? 'not_applicable' : 'available';
     let realtimeMessage = '';
     let realtimeFeedTimestamp = null;
+    let realtimeDiagnostics = null;
+    let diagnosticFeed = null;
+    let realtimeDebugError = '';
 
     if (!metro) {
       try {
         const feed = await getRealtimeFeed();
+        diagnosticFeed = feed;
         realtimeFeedTimestamp = feed.feedTimestamp;
         realtimeBoard = buildBoard(
           feed.updates,
@@ -1334,18 +1393,30 @@ module.exports =
         const detail = error?.name === 'AbortError'
           ? 'Sofia Traffic GTFS-RT request timed out.'
           : (error?.message || 'Unable to fetch/decode GTFS-RT.');
+        realtimeDebugError = detail;
         console.warn(`GTSofia realtime fallback for stop ${stopCode}: ${detail}`);
       }
     }
 
     try {
       const board = buildVirtualBoard(realtimeBoard, stopCode, now);
+      if (debugEnabled && !metro && realtimeDiagnostics === null && realtimeStatus === 'available') {
+        // Feed was fetched successfully but may contain zero entities after
+        // decoding; diagnostics help distinguish feed/decoder problems from
+        // static-trip matching and stop-update resolution failures.
+        realtimeDiagnostics = summarizeRealtimeDiagnostics(
+          diagnosticFeed,
+          board,
+          Math.floor(Date.now() / 1000)
+        );
+      }
       setBoardResponseHeaders(res);
       return res.status(200).json({
         ...board,
         realtime_status: realtimeStatus,
         realtime_message: realtimeMessage,
         realtime_feed_timestamp: realtimeFeedTimestamp,
+        ...(debugEnabled ? { realtime_diagnostics: realtimeDiagnostics || { feed: realtimeStatus, message: realtimeMessage, error: realtimeDebugError || null } } : {}),
         refreshed_at: Math.floor(Date.now() / 1000)
       });
     } catch (error) {

@@ -12,8 +12,8 @@ const MAX_STATIC_LOOKAHEAD_SECONDS = 2 * 60 * 60;
 const MAX_REALTIME_LOOKAHEAD_SECONDS = 2 * 60 * 60;
 // Allow only minor feed/clock jitter after the predicted stop time.
 const REALTIME_PAST_GRACE_SECONDS = 0;
-// Application freshness policy. GTFS-Realtime recommends TripUpdate.timestamp
-// but does not prescribe an expiry threshold; missing timestamps remain usable.
+// Application freshness policy for relative delay estimates only.
+// GTFS-Realtime does not prescribe a universal TripUpdate.timestamp expiry.
 const MAX_TRIP_UPDATE_AGE_SECONDS = 120;
 const MAX_TRIP_UPDATE_FUTURE_SKEW_SECONDS = 60;
 
@@ -541,7 +541,12 @@ function createDataContext(data = {}) {
     return byNumber || (numeric === null ? 'SCHEDULED' : `UNKNOWN_${numeric}`);
   }
 
-  function isTripUpdateFresh(realtimeTrip, now) {
+  // TripUpdate.timestamp is the time of the latest vehicle-progress
+  // measurement, not the publication time of an absolute StopTimeEvent.time.
+  // Its age is therefore used only when we must extrapolate a relative delay.
+  // A future absolute event remains independently checkable against now and
+  // the board look-ahead window, even when the last measurement is older.
+  function isTripUpdateTimestampFresh(realtimeTrip, now) {
     const updatedAt = optionalFiniteNumber(realtimeTrip?.trip_update_timestamp);
     if (updatedAt === null) return true;
 
@@ -637,7 +642,7 @@ function createDataContext(data = {}) {
     return parseGtfsTime(schedule?.times?.[stopIndex]);
   }
 
-  function getRealtimeEventDelay(event, stopIndex, schedule, serviceDate, eventType = 'departure') {
+  function getRealtimeEventDelay(event, stopIndex, schedule, serviceDate, eventType = 'departure', allowRelativeDelay = true) {
     // StopTimeEvent.time is authoritative when both time and delay are set.
     // Compare it with the matching static event (arrival vs departure).
     const timestamp = optionalFiniteNumber(event?.timestamp);
@@ -648,7 +653,7 @@ function createDataContext(data = {}) {
       return timestamp - scheduledTimestamp;
     }
 
-    return optionalFiniteNumber(event?.delay);
+    return allowRelativeDelay ? optionalFiniteNumber(event?.delay) : null;
   }
 
   function resolveScheduledTripAtStop(realtimeTrip, staticInfo, selectedStopId, now, requestedStopIndex = null) {
@@ -672,9 +677,6 @@ function createDataContext(data = {}) {
     if (relationship !== 'SCHEDULED') {
       return { state: 'unsupported', suppressStatic: false, reason: 'non-scheduled-trip' };
     }
-    if (!isTripUpdateFresh(realtimeTrip, now)) {
-      return { state: 'stale', suppressStatic: false, reason: 'stale-trip-update' };
-    }
     if (!staticInfo) {
       return { state: 'invalid', suppressStatic: false, reason: 'static-trip-not-found' };
     }
@@ -696,7 +698,10 @@ function createDataContext(data = {}) {
       return { state: 'invalid', suppressStatic: false, reason: mapped.reason };
     }
 
-    let propagatedDelay = optionalFiniteNumber(realtimeTrip?.trip_delay);
+    const relativeDelayIsFresh = isTripUpdateTimestampFresh(realtimeTrip, now);
+    let propagatedDelay = relativeDelayIsFresh
+      ? optionalFiniteNumber(realtimeTrip?.trip_delay)
+      : null;
     let propagatedUncertainty = null;
     let propagatedFrom = propagatedDelay === null ? '' : 'trip-delay';
     let targetUpdate = null;
@@ -728,7 +733,14 @@ function createDataContext(data = {}) {
       const event = getRealtimeEvent(item.update, !isTargetStop);
       const eventType = event ? getRealtimeEventType(item.update, event) : 'departure';
       const eventDelay = event
-        ? getRealtimeEventDelay(event, item.stopIndex, staticInfo.schedule, staticInfo.serviceDate || now, eventType)
+        ? getRealtimeEventDelay(
+          event,
+          item.stopIndex,
+          staticInfo.schedule,
+          staticInfo.serviceDate || now,
+          eventType,
+          relativeDelayIsFresh
+        )
         : null;
 
       // A SCHEDULED update supersedes inherited TripUpdate.delay. If its event
@@ -800,7 +812,7 @@ function createDataContext(data = {}) {
 
   function buildRealtimeRouteFromTripUpdate(realtimeTrip, selectedStopId, now) {
     const relationship = getTripRelationship(realtimeTrip);
-    if (relationship !== 'SCHEDULED' || !isTripUpdateFresh(realtimeTrip, now)) return null;
+    if (relationship !== 'SCHEDULED') return null;
 
     const realtimeDate = normalizeServiceDate(
       realtimeTrip?.trip_start_date || realtimeTrip?.start_date
@@ -1100,7 +1112,7 @@ function createDataContext(data = {}) {
       if (relationship === 'CANCELED' || relationship === 'DELETED' || relationship === 'REPLACEMENT') {
         return true;
       }
-      if (relationship !== 'SCHEDULED' || !isTripUpdateFresh(realtimeTrip, now)) continue;
+      if (relationship !== 'SCHEDULED') continue;
 
       const staticInfo = findStaticScheduleInfoForRealtime(
         realtimeTrip?.route_id,
@@ -1128,7 +1140,6 @@ function createDataContext(data = {}) {
     // selected stop. It replaces only the matching static trip, not every trip
     // on the same route or every stop along the trip.
     for (const realtime of realtimeRoutes) {
-      if (!isTripUpdateFresh(realtime, now)) continue;
       if (!staticArrivalMatchesRealtimeDescriptor(staticArrival, realtime, now)) continue;
 
       const staticSequence = optionalFiniteNumber(staticArrival.stop_sequence);
@@ -1239,7 +1250,6 @@ function createDataContext(data = {}) {
         return (sameTripId || sameDescriptorTuple) && optionalFieldsAgree;
       });
       if (hasFullDescriptor) continue;
-      if (!isTripUpdateFresh(route, now)) continue;
 
       const relationshipName = String(route?.schedule_relationship_name || '').trim().toUpperCase();
       const relationship = optionalFiniteNumber(route?.schedule_relationship);
@@ -1320,6 +1330,11 @@ function createDataContext(data = {}) {
       const times = route.times.map(time => {
         let timestamp = optionalFiniteNumber(time?.timestamp);
         const delay = optionalFiniteNumber(time?.delay);
+        // Absolute StopTimeEvent.time is assessed on its own merits. A stale
+        // TripUpdate.timestamp only makes a delay-only estimate unsuitable.
+        if (timestamp === null && delay !== null && !isTripUpdateTimestampFresh(route, now)) {
+          return null;
+        }
         const eventType = String(time?.event_type || 'departure').toLowerCase() === 'arrival'
           ? 'arrival'
           : 'departure';

@@ -160,6 +160,9 @@ const normalTrip = encodeTripUpdate({
     startTime: normalFallbackCourse.trip_start_time,
     routeId: 'TB2'
   },
+  // The absolute StopTimeEvent.time remains independently usable; the
+  // TripUpdate.timestamp is only the last vehicle-progress measurement.
+  timestamp: now - 300,
   stopUpdates: [{
     stopId: '0605',
     relationship: 0,
@@ -247,7 +250,7 @@ global.fetch = async () => {
 
 const req = {
   method: 'GET',
-  query: { stop_code: '0605' }
+  query: { stop_code: '0605', debug: '1' }
 };
 
 let payload = null;
@@ -272,6 +275,15 @@ const res = {
   assert.equal(typeof payload.generated_at, 'number');
   assert.equal(payload.realtime_status, 'available');
   assert.equal(realtimeFetchCount, 1, 'the first manual board load should fetch the realtime feed');
+  assert.ok(payload.realtime_diagnostics, 'debug mode should expose feed and output counters');
+  assert.ok(payload.realtime_diagnostics.decoded_trip_updates > 0,
+    'debug mode should report decoded TripUpdates from the feed');
+  assert.ok(payload.realtime_diagnostics.output_realtime_arrivals > 0,
+    'debug mode should report realtime arrivals in the final board response');
+  assert.ok(Array.isArray(payload.realtime_diagnostics.trip_update_samples),
+    'debug mode should include a small sample of decoded trip descriptors and stop updates');
+  assert.ok(payload.realtime_diagnostics.trip_updates_older_than_120_seconds > 0,
+    'the fixture must include TripUpdates with older vehicle-measurement timestamps');
   assert.equal(Object.hasOwn(payload, 'active_trips'), false);
   assert.equal(Object.hasOwn(payload, 'skipped_trips'), false);
 
@@ -346,6 +358,8 @@ const res = {
   assert.equal(res.statusCode, 200, 'upstream realtime failure must not fail the entire virtual-board request');
   assert.equal(payload.realtime_status, 'unavailable');
   assert.match(payload.realtime_message, /показваме разписанието/i);
+  assert.match(payload.realtime_diagnostics.error, /simulated upstream outage/i,
+    'debug mode should expose the underlying upstream failure without changing the public fallback message');
   assert.ok(Array.isArray(payload.routes), 'the GTFS fallback must still return board rows');
   assert.ok(
     payload.routes.every(route => route.times.every(time => time.scheduled === true)),
@@ -368,6 +382,8 @@ const res = {
   await handler(req, res);
   assert.equal(res.statusCode, 200);
   assert.equal(payload.realtime_status, 'unavailable', 'stale realtime snapshots must fall back to GTFS');
+  assert.match(payload.realtime_diagnostics.error, /stale/i,
+    'debug mode should explain when the feed-level timestamp made the snapshot stale');
   assert.ok(payload.routes.every(route => route.times.every(time => time.scheduled === true)));
 
   // Missing feed timestamps are unknown freshness, not permission to stamp

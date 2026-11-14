@@ -1520,4 +1520,51 @@ assert.ok(
   'bus 190 must show a realtime prediction at stop 1411 from a time-only update at the origin'
 );
 
+
+// TripUpdate.timestamp records the latest measured vehicle progress. It must
+// not discard an otherwise valid future absolute StopTimeEvent.time simply
+// because that measurement is older than the application's relative-delay
+// freshness threshold.
+const fiveMinutesAgo = Math.floor(now.getTime() / 1000) - 5 * 60;
+const staleMeasurementAbsoluteTimeBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'GTFS-TRIP-A', route_id: 'TB7', trip_start_date: '20261030',
+    trip_start_time: '13:00:00', direction_id: 'D1', schedule_relationship: 0,
+    trip_update_timestamp: fiveMinutesAgo,
+    stop_time_updates: [{
+      stop_id: 'BOARD', stop_sequence: 2, schedule_relationship: 0,
+      arrival: { timestamp: Date.parse('2026-10-30T13:42:00+02:00') / 1000 }
+    }]
+  }]
+}, '0200', now);
+const staleMeasurementAbsoluteTime = staleMeasurementAbsoluteTimeBoard.routes
+  .flatMap(route => route.times)
+  .find(time => time.source === 'realtime' && time.trip_id === 'GTFS-TRIP-A');
+assert.equal(staleMeasurementAbsoluteTime?.timestamp, Date.parse('2026-10-30T13:42:00+02:00') / 1000,
+  'an absolute future StopTimeEvent.time remains usable with an older TripUpdate.timestamp');
+
+// Delay-only estimates depend on the timestamp of the last measured progress.
+// When that measurement is stale, do not extrapolate the old delay; keep GTFS.
+const staleMeasurementDelayOnlyBoard = service.buildBoard({
+  routes: [],
+  skipped_trips: [],
+  realtime_trips: [{
+    trip_id: 'GTFS-TRIP-A', route_id: 'TB7', trip_start_date: '20261030',
+    trip_start_time: '13:00:00', direction_id: 'D1', schedule_relationship: 0,
+    trip_update_timestamp: fiveMinutesAgo,
+    stop_time_updates: [{
+      stop_id: 'BOARD', stop_sequence: 2, schedule_relationship: 0,
+      arrival: { delay: 120 }
+    }]
+  }]
+}, '0200', now);
+const staleDelayTimes = staleMeasurementDelayOnlyBoard.routes
+  .flatMap(route => route.times);
+assert.ok(staleDelayTimes.some(time => time.scheduled && time.trip_id === 'GTFS-TRIP-A'),
+  'a stale delay-only update must retain the scheduled GTFS fallback');
+assert.ok(!staleDelayTimes.some(time => time.source === 'realtime' && time.trip_id === 'GTFS-TRIP-A'),
+  'a stale delay-only update must not be presented as realtime');
+
 console.log('virtual-board-service: all tests passed');
