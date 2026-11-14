@@ -395,7 +395,13 @@ function createDataContext(data = {}) {
         const direction = directions?.[wantedRouteId]?.[directionKey];
         if (!direction) continue;
         const actualDirectionId = String(direction.direction_id ?? '').trim();
-        if (actualDirectionId !== wantedDirectionId) continue;
+        // direction_id is optional in static GTFS. Sofia's current static
+        // dataset leaves it empty for every direction, while a producer may
+        // still include direction_id in TripDescriptor. Compare it only when
+        // the static feed actually defines a value; if it does not, retain
+        // candidates and require the route + start_time + service date to
+        // resolve to exactly one course below.
+        if (actualDirectionId && actualDirectionId !== wantedDirectionId) continue;
 
         const rows = Array.isArray(daySchedules?.[currentDayType]) ? daySchedules[currentDayType] : [];
         for (const schedule of rows) {
@@ -452,7 +458,10 @@ function createDataContext(data = {}) {
         && String(exactMatch.schedule?.start_time || '').trim() !== wantedStartTime) return null;
       if (!wantedDate && parseGtfsTime(exactMatch.schedule?.start_time) >= 24 * 60 * 60) return null;
       const matchedDirectionId = String(exactMatch.direction?.direction_id ?? '').trim();
-      if (wantedDirectionId && matchedDirectionId !== wantedDirectionId) return null;
+      // A Trip ID identifies the scheduled trip. direction_id is an optional
+      // consistency check, not a mandatory field in static GTFS; an empty
+      // static value cannot contradict a populated realtime value.
+      if (wantedDirectionId && matchedDirectionId && matchedDirectionId !== wantedDirectionId) return null;
       return exactMatch;
     }
 

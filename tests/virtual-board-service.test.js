@@ -437,6 +437,57 @@ assert.ok(mismatchedDirectionBoard.routes.find(route => route.route_id === 'TB7'
 assert.ok(!mismatchedDirectionBoard.routes.flatMap(route => route.times).some(time => !time.scheduled),
   'a SCHEDULED TripUpdate with a direction_id conflict must not be rendered');
 
+// The production Sofia static dataset currently omits direction_id. A
+// populated realtime direction_id must not invalidate an exact Trip ID match
+// when static GTFS has no value to compare against.
+const directionlessFixture = createFixture();
+directionlessFixture.directions.TB7.D1.direction_id = '';
+const directionlessService = createDataContext(directionlessFixture);
+const realtimeDirectionWithoutStaticDirection = directionlessService.buildBoard({
+  routes: [],
+  realtime_trips: [{
+    trip_id: 'GTFS-TRIP-A',
+    trip_start_date: '20261030',
+    trip_start_time: '13:00:00',
+    route_id: 'TB7',
+    direction_id: '0',
+    schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    trip_update_timestamp: Date.parse('2026-10-30T13:00:00+02:00') / 1000,
+    stop_time_updates: [{
+      stop_id: 'BOARD', stop_sequence: 2, schedule_relationship: 0,
+      arrival: { timestamp: Date.parse('2026-10-30T13:44:00+02:00') / 1000 },
+      departure: null
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+const directionlessRealtime = realtimeDirectionWithoutStaticDirection.routes.find(route => route.route_id === 'TB7');
+assert.ok(directionlessRealtime?.times.some(time => !time.scheduled
+  && time.trip_id === 'GTFS-TRIP-A'),
+  'an exact Trip ID match must remain valid when static GTFS omits direction_id');
+
+// When Trip ID is missing, a realtime direction_id can still be accepted if
+// static GTFS omits direction_id and route + date + start_time resolves to one
+// and only one static course. Ambiguous matches remain rejected.
+const directionlessNoId = directionlessService.buildBoard({
+  routes: [],
+  realtime_trips: [{
+    trip_id: '', trip_start_date: '20261030', trip_start_time: '13:00:00',
+    route_id: 'TB7', direction_id: '0', schedule_relationship: 0,
+    schedule_relationship_name: 'SCHEDULED',
+    trip_update_timestamp: Date.parse('2026-10-30T13:00:00+02:00') / 1000,
+    stop_time_updates: [{
+      stop_id: 'BOARD', stop_sequence: 2, schedule_relationship: 0,
+      arrival: { timestamp: Date.parse('2026-10-30T13:44:00+02:00') / 1000 },
+      departure: null
+    }]
+  }],
+  skipped_trips: []
+}, '0200', now);
+assert.ok(directionlessNoId.routes.find(route => route.route_id === 'TB7')?.times.some(time => !time.scheduled),
+  'a descriptor without Trip ID may use a unique route/date/start_time match when static direction_id is absent');
+
 const nearButNotExactStartBoard = service.buildBoard({
   routes: [{
     route_id: 'TB7', trip_id: 'GTFS-TRIP-A', trip_start_date: '20261030',
